@@ -183,19 +183,24 @@ def calcular_carga_total_medico(grupo_pacientes):
 def aplicar_peculiaridades(pacientes, peculiaridades, num_medicos):
     avisos = []
     for linha in peculiaridades:
+        norm_linha = normalizar_texto(linha)
+        eh_exclusao = bool(re.search(r"\b(excluir|exclui|tirar|tira|remover|remove|alta|obito|ignorar|retirar)\b", norm_linha))
         m_med = re.search(r"\b(?:m|med|medico|médico)\s*(\d+)\b", linha, re.IGNORECASE)
-        if not m_med:
-            avisos.append(f"Não identifiquei qual médico na regra: '{linha}'")
+
+        if not eh_exclusao and not m_med:
+            avisos.append(f"Não identifiquei qual médico ou ação na regra: '{linha}'")
             continue
 
-        med_num = int(m_med.group(1))
-        if med_num < 1 or med_num > num_medicos:
-            avisos.append(f"Médico M{med_num} fora do intervalo (1 a {num_medicos}) em: '{linha}'")
-            continue
+        med_num = None
+        if not eh_exclusao:
+            med_num = int(m_med.group(1))
+            if med_num < 1 or med_num > num_medicos:
+                avisos.append(f"Médico M{med_num} fora do intervalo (1 a {num_medicos}) em: '{linha}'")
+                continue
 
         resto = re.sub(r"\b(?:m|med|medico|médico)\s*\d+\b", " ", linha, flags=re.IGNORECASE)
         resto = re.sub(
-            r"\b(?:deixar|colocar|ficar|com|para|o|a|os|as|paciente|pacientes|leito|leitos|pq|porque|ele|ela|quer|ver|esse|essa|esses|essas)\b",
+            r"\b(?:excluir|exclui|tirar|tira|remover|remove|alta|óbito|obito|ignorar|retirar|deixar|colocar|ficar|com|para|o|a|os|as|paciente|pacientes|leito|leitos|pq|porque|ele|ela|quer|ver|esse|essa|esses|essas|da|do|lista)\b",
             " ",
             resto,
             flags=re.IGNORECASE,
@@ -209,19 +214,29 @@ def aplicar_peculiaridades(pacientes, peculiaridades, num_medicos):
 
             encontrados = []
             for p in pacientes:
+                if p.get("excluido"):
+                    continue
                 nome_norm = normalizar_texto(p["nome"])
                 leito_norm = normalizar_texto(p["leito"]).replace(" ", "")
                 termo_sem_espaco = termo_norm.replace(" ", "").replace("-", "")
 
                 if termo_norm in nome_norm or (termo_sem_espaco.isdigit() and termo_sem_espaco in leito_norm):
-                    p["medico_fixo"] = med_num
+                    if eh_exclusao:
+                        p["excluido"] = True
+                    else:
+                        p["medico_fixo"] = med_num
                     encontrados.append(f"{p['nome']} ({p['leito']})")
 
             if encontrados:
-                avisos.append(f"Fixado em M{med_num}: {', '.join(encontrados)}")
+                if eh_exclusao:
+                    avisos.append(f"Excluído da lista: {', '.join(encontrados)}")
+                else:
+                    avisos.append(f"Fixado em M{med_num}: {', '.join(encontrados)}")
             else:
-                avisos.append(f"Aviso: nenhum paciente encontrado para '{termo}' (regra M{med_num})")
+                alvo_lbl = "exclusão" if eh_exclusao else f"regra M{med_num}"
+                avisos.append(f"Aviso: nenhum paciente encontrado para '{termo}' ({alvo_lbl})")
 
+    pacientes[:] = [p for p in pacientes if not p.get("excluido")]
     return avisos
 
 
@@ -730,9 +745,9 @@ arquivo_pdf = st.file_uploader("1. Envie o PDF da lista de internados", type=["p
 num_medicos = st.number_input("2. Número de médicos hoje", min_value=2, max_value=12, value=7, step=1)
 
 peculiaridades_txt = st.text_area(
-    "3. Peculiaridades / Fixos do dia (opcional)",
-    placeholder="Ex: M3: Paciente A, Paciente B",
-    height=75,
+    "3. Peculiaridades / Fixos / Exclusões do dia (opcional)",
+    placeholder="Ex: M3: Paciente A, Paciente B\nExcluir: Paciente C, 1310 01",
+    height=85,
 )
 
 interconsultas_txt = st.text_area(
