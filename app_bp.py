@@ -5,12 +5,12 @@ import fitz  # PyMuPDF
 import streamlit as st
 
 st.set_page_config(
-    page_title="Divisão BP - Internados",
+    page_title="Divisão BP v2.0 - Internados",
     page_icon="🏥",
     layout="centered",
 )
 
-# Parâmetros clínicos de carga e deslocamento (v4)
+# Parâmetros clínicos de carga e deslocamento (v2.0)
 PESO_PACIENTE_PADRAO = 1.0
 PESO_ADMISSAO_NOVA = 1.5
 PESO_INTERCONSULTA = 1.0
@@ -38,30 +38,73 @@ def normalizar_texto(txt: str) -> str:
 
 
 def extrair_leito_texto(texto: str):
-    texto = texto.replace("\xa0", " ")
-    m_esp = re.search(r"\b(PREXA\s*\d+|1S\s*\d+|2S\s*\d+)\b", texto, re.IGNORECASE)
+    texto_clean = texto.replace("\xa0", " ")
+    norm = normalizar_texto(texto_clean)
+
+    # 1. Padrões explícitos de leito/setor especial (inclui UTIE, UTI 1S, 1S, PREXA, 2S, UIH)
+    m_esp = re.search(
+        r"\b(PREXA\s*\d*|UTIE\s*\d*|UTI\s*1S\s*\d*|1S\s*\d+|2S\s*\d+|UIH\d*\s*\d+)\b",
+        texto_clean,
+        re.IGNORECASE,
+    )
     if m_esp:
-        return m_esp.group(1).upper()
-    sem_atend = re.sub(r"\d{5,}", " ", texto)
+        return re.sub(r"\s+", " ", m_esp.group(1).upper()).strip()
+
+    # 2. Hemodinâmica ou 2º subsolo -> mesmo eixo de PREXA (Torre 4, 2º subsolo)
+    if re.search(r"\b(hemo|hemodinamica)\b", norm) or re.search(r"\b2\s*[ºo°]?\s*subsolo\b", norm):
+        return "HEMO 2S"
+
+    # 3. 1º subsolo -> Torre 5 / PS / UTIE
+    if re.search(r"\b1\s*[ºo°]?\s*subsolo\b", norm):
+        return "1S"
+
+    # 4. Subsolo genérico -> 2º subsolo (Torre 4)
+    if re.search(r"\bsubsolo\b", norm):
+        return "2S"
+
+    # 5. Leito numérico padrão (4 dígitos + opcional leito)
+    sem_atend = re.sub(r"\d{5,}", " ", texto_clean)
     sem_torre_txt = re.sub(r"\btorre\s*[1-7]\b", " ", sem_atend, flags=re.IGNORECASE)
     m_leito = re.search(r"\b([1-7]\d{3})(?:[-\s]+(\d{1,2}))?\b", sem_torre_txt)
     if m_leito:
         quarto = m_leito.group(1)
         leito = m_leito.group(2) or "01"
         return f"{quarto} {leito}"
+
     return None
 
 
 def chave_localizacao(leito: str):
     leito_clean = leito.replace("\xa0", " ").strip().upper()
-    if leito_clean.startswith("1S"):
-        num = int(re.sub(r"\D", "", leito_clean[2:]) or 0)
+    norm = normalizar_texto(leito_clean)
+
+    # 1º Subsolo / PS / UTI 1S / UTIE -> Torre 5, andar -1
+    if (
+        leito_clean.startswith("1S")
+        or leito_clean.startswith("UTI 1S")
+        or leito_clean.startswith("UTI1S")
+        or leito_clean.startswith("UTIE")
+    ):
+        num = int(re.sub(r"\D", "", re.sub(r"^(?:UTIE|UTI\s*1S|1S)", "", leito_clean)) or 0)
         return (1, 5, -1, num, 0)
 
-    if "PREXA" in leito_clean or leito_clean.startswith("2S"):
-        num = int(re.sub(r"\D", "", leito_clean) or 0)
+    # PREXA / Hemodinâmica / 2º Subsolo -> Torre 4, andar -2 (entre Torres 3 e 5)
+    if (
+        "PREXA" in leito_clean
+        or leito_clean.startswith("2S")
+        or re.search(r"\b(hemo|hemodinamica)\b", norm)
+    ):
+        num = int(re.sub(r"\D", "", re.sub(r"^2S", "", leito_clean)) or 0)
         return (1, 4, -2, num, 0)
 
+    # UIH (Unidade de Internação Hospitalar) -> Paulista, Torre 5, térreo
+    if leito_clean.startswith("UIH"):
+        nums = re.findall(r"\d+", leito_clean)
+        unidade = int(nums[0]) if len(nums) >= 1 else 1
+        leito_num = int(nums[1]) if len(nums) >= 2 else 0
+        return (1, 5, 0, unidade * 100 + leito_num, 0)
+
+    # Leitos padrão 1000..7999
     m = re.match(r"^(\d)(\d)(\d{2})(?:[-\s]+(\d+))?$", leito_clean)
     if m:
         torre = int(m.group(1))
@@ -74,14 +117,15 @@ def chave_localizacao(leito: str):
     return (99, 99, 99, 99, 99)
 
 
-def interpretar_interconsultas_whatsapp(linhas):
+def interpretar_texto_livre_pacientes(linhas, prefixo_strip_regex=None):
     torre_contexto = None
     contador_sem_leito_por_torre = {}
     resultado = []
 
     for linha in linhas:
         limpa = re.sub(r"[\U00010000-\U0010ffff\u200d\ufe0f\u20e3]", "", linha).replace("\xa0", " ").strip()
-        limpa = re.sub(r"^\[IC\]\s*", "", limpa, flags=re.IGNORECASE).strip()
+        if prefixo_strip_regex:
+            limpa = re.sub(prefixo_strip_regex, "", limpa, flags=re.IGNORECASE).strip()
         norm = normalizar_texto(limpa)
 
         if "mirante" in norm and len(norm) <= 30:
@@ -93,7 +137,7 @@ def interpretar_interconsultas_whatsapp(linhas):
             torre_contexto = int(m_torre_isolada.group(1))
             continue
 
-        if "sem pacientes" in norm or len(limpa) < 4:
+        if "sem pacientes" in norm or len(limpa) < 3:
             continue
 
         torre_linha = torre_contexto
@@ -108,14 +152,19 @@ def interpretar_interconsultas_whatsapp(linhas):
             loc_key = chave_localizacao(leito_detectado)
             if loc_key[1] == 4:
                 torre_linha = 4
-                descricao_loc = f"Leito {leito_detectado} (2º Subsolo - entre Torres 3 e 5)"
-            elif leito_detectado.startswith("1S"):
+                descricao_loc = f"{leito_detectado} (Torre 4, 2º Subsolo - PREXA/Hemo)"
+            elif loc_key[1] == 5 and loc_key[2] == -1:
                 torre_linha = 5
-                descricao_loc = f"Leito {leito_detectado} (PS - Torre 5)"
-            else:
+                descricao_loc = f"{leito_detectado} (Torre 5, 1º Subsolo - PS/UTIE)"
+            elif loc_key[0] in (1, 2):
                 torre_linha = loc_key[1]
                 predio_lbl = "Mirante" if loc_key[0] == 2 else f"Torre {loc_key[1]}"
                 descricao_loc = f"Leito {leito_detectado} ({predio_lbl}, {loc_key[2]}º andar)"
+            else:
+                descricao_loc = f"Leito {leito_detectado}"
+        elif torre_linha == 4:
+            loc_key = (1, 4, -2, 0, 0)
+            descricao_loc = "Torre 4 (2º Subsolo - PREXA/Hemo)"
         elif torre_linha:
             predio = 2 if torre_linha in (6, 7) else 1
             idx_andar = contador_sem_leito_por_torre.get(torre_linha, 0) + 1
@@ -130,13 +179,15 @@ def interpretar_interconsultas_whatsapp(linhas):
         texto_exibicao = re.sub(r"\s+", " ", limpa).strip()
         if torre_linha in (6, 7) and "mirante" not in norm:
             texto_exibicao = f"[Mirante] {texto_exibicao}"
+        elif torre_linha == 4 and not re.search(r"\b(prexa|hemo|hemodinamica|subsolo|2s|torre\s*4)\b", norm):
+            texto_exibicao = f"[Torre 4 / Subsolo] {texto_exibicao}"
         elif torre_linha and torre_linha != 4 and "torre" not in norm and not leito_detectado:
             texto_exibicao = f"[Torre {torre_linha}] {texto_exibicao}"
 
         resultado.append({
             "texto": texto_exibicao,
             "torre": torre_linha,
-            "leito": leito_detectado,
+            "leito": leito_detectado or "",
             "loc_key": loc_key,
             "descricao_loc": descricao_loc,
         })
@@ -155,9 +206,10 @@ def calcular_custo_deslocamento_grupo(lista_loc_keys):
         custo += CUSTO_DESLOC_MIRANTE
 
     torres_reais_paulista = {lk[1] for lk in validas if lk[0] == 1 and lk[1] != 4}
-    tem_prexa = any(lk[0] == 1 and lk[1] == 4 for lk in validas)
+    tem_torre_4_subsolo = any(lk[0] == 1 and lk[1] == 4 for lk in validas)
 
-    if tem_prexa and not (3 in torres_reais_paulista or 5 in torres_reais_paulista):
+    # Torre 4 (2º subsolo: PREXA/Hemo) fica entre Torres 3 e 5 (sem troca extra se já estiver em 3 ou 5)
+    if tem_torre_4_subsolo and not (3 in torres_reais_paulista or 5 in torres_reais_paulista):
         torres_efetivas = len(torres_reais_paulista) + 1
     else:
         torres_efetivas = len(torres_reais_paulista)
@@ -180,7 +232,8 @@ def calcular_carga_total_medico(grupo_pacientes):
     return peso_pacs + custo_desloc
 
 
-def aplicar_peculiaridades(pacientes, peculiaridades, num_medicos):
+def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
+    """Aplica fixação em M_x ou exclusão sobre TODOS os itens (PDF + Interconsultas + Admissões extras)."""
     avisos = []
     for linha in peculiaridades:
         norm_linha = normalizar_texto(linha)
@@ -200,12 +253,12 @@ def aplicar_peculiaridades(pacientes, peculiaridades, num_medicos):
 
         resto = re.sub(r"\b(?:m|med|medico|médico)\s*\d+\b", " ", linha, flags=re.IGNORECASE)
         resto = re.sub(
-            r"\b(?:excluir|exclui|tirar|tira|remover|remove|alta|óbito|obito|ignorar|retirar|deixar|colocar|ficar|com|para|o|a|os|as|paciente|pacientes|leito|leitos|pq|porque|ele|ela|quer|ver|esse|essa|esses|essas|da|do|lista)\b",
+            r"\b(?:excluir|exclui|tirar|tira|remover|remove|alta|óbito|obito|ignorar|retirar|deixar|colocar|ficar|com|para|o|a|os|as|paciente|pacientes|leito|leitos|pq|porque|ele|ela|quer|ver|esse|essa|esses|essas|da|do|lista|ic|interconsulta|admissao|admissão)\b",
             " ",
             resto,
             flags=re.IGNORECASE,
         )
-        termos = [t.strip(" :-–—>") for t in re.split(r"[,;/]|\s+e\s+", resto) if t.strip(" :-–—>")]
+        termos = [t.strip(" .:-–—>") for t in re.split(r"[,;/]|\s+e\s+", resto) if t.strip(" .:-–—>")]
 
         for termo in termos:
             termo_norm = normalizar_texto(termo)
@@ -213,30 +266,36 @@ def aplicar_peculiaridades(pacientes, peculiaridades, num_medicos):
                 continue
 
             encontrados = []
-            for p in pacientes:
-                if p.get("excluido"):
+            for item in todos_itens:
+                if item.get("excluido"):
                     continue
-                nome_norm = normalizar_texto(p["nome"])
-                leito_norm = normalizar_texto(p["leito"]).replace(" ", "")
+                nome_norm = normalizar_texto(item["nome"])
+                leito_norm = normalizar_texto(item.get("leito", "")).replace(" ", "")
                 termo_sem_espaco = termo_norm.replace(" ", "").replace("-", "")
 
-                if termo_norm in nome_norm or (termo_sem_espaco.isdigit() and termo_sem_espaco in leito_norm):
+                match_nome = termo_norm in nome_norm
+                match_leito = termo_sem_espaco.isdigit() and len(termo_sem_espaco) >= 4 and (
+                    termo_sem_espaco in leito_norm or termo_sem_espaco in nome_norm.replace(" ", "").replace("-", "")
+                )
+
+                if match_nome or match_leito:
                     if eh_exclusao:
-                        p["excluido"] = True
+                        item["excluido"] = True
                     else:
-                        p["medico_fixo"] = med_num
-                    encontrados.append(f"{p['nome']} ({p['leito']})")
+                        item["medico_fixo"] = med_num
+                    tag = f"[{item['origem']}] " if item["origem"] != "PDF" else ""
+                    leito_lbl = f" ({item['leito']})" if item.get("leito") else ""
+                    encontrados.append(f"{tag}{item['nome']}{leito_lbl}")
 
             if encontrados:
                 if eh_exclusao:
-                    avisos.append(f"Excluído da lista: {', '.join(encontrados)}")
+                    avisos.append(f"Excluído: {', '.join(encontrados)}")
                 else:
                     avisos.append(f"Fixado em M{med_num}: {', '.join(encontrados)}")
             else:
                 alvo_lbl = "exclusão" if eh_exclusao else f"regra M{med_num}"
                 avisos.append(f"Aviso: nenhum paciente encontrado para '{termo}' ({alvo_lbl})")
 
-    pacientes[:] = [p for p in pacientes if not p.get("excluido")]
     return avisos
 
 
@@ -284,6 +343,9 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
                     loc_ini = itens_livres[p]["loc_key"]
                     if loc_ant[:3] == loc_ini[:3]:
                         penalidade_corte_andar = 0.25
+                    # Regra absoluta: não dividir o Mirante (prédio 2) entre dois médicos
+                    if loc_ant[0] == 2 and loc_ini[0] == 2:
+                        penalidade_corte_andar += 200.0
 
                 custo = dp[j - 1][p] + ((carga_total_med - carga_ideal) ** 2) * 2.0 + penalidade_corte_andar
                 if custo < dp[j][i]:
@@ -300,21 +362,32 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
     return grupos
 
 
-def escolher_medico_interconsulta(item_ic, grupos_finais):
-    loc_ic = item_ic["loc_key"]
-    torre_ic = item_ic["torre"]
+def escolher_medico_item_extra(item, grupos_finais):
+    # Se já foi fixado manualmente nas peculiaridades (M1..Mk), respeita imediatamente
+    if item.get("medico_fixo") is not None:
+        return item["medico_fixo"] - 1
+
+    loc_ic = item["loc_key"]
+    torre_ic = item.get("torre")
 
     def tem_na_lista_original(grupo, pred):
         return any(p.get("origem") == "PDF" and pred(p["loc_key"]) for p in grupo)
 
-    if loc_ic[0] in (1, 2):
+    def ja_tem_qualquer_no_mirante(grupo):
+        return any(p["loc_key"][0] == 2 for p in grupo)
+
+    eh_mirante = (loc_ic[0] == 2) or (torre_ic in (6, 7))
+    if eh_mirante:
+        # Regra absoluta: TODO o Mirante (PDF + ICs + ADMs) fica com UM único médico
+        ja_no_mirante = [i for i, g in enumerate(grupos_finais) if ja_tem_qualquer_no_mirante(g)]
+        if ja_no_mirante:
+            return min(ja_no_mirante, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
+        return min(range(len(grupos_finais)), key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
+
+    if loc_ic[0] == 1:
         predio_ic, eixo_torre, andar_ic, quarto_ic, _ = loc_ic
 
-        if predio_ic == 2:
-            titulares_mirante = [i for i, g in enumerate(grupos_finais) if tem_na_lista_original(g, lambda lk: lk[0] == 2)]
-            if titulares_mirante:
-                return min(titulares_mirante, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
-
+        # Torre 4 (2º subsolo: PREXA / Hemo) -> preferir quem já passa nas Torres 3, 4 ou 5
         if eixo_torre == 4:
             no_eixo_3_5 = [
                 i for i, g in enumerate(grupos_finais)
@@ -346,15 +419,9 @@ def escolher_medico_interconsulta(item_ic, grupos_finais):
             return min(mesma_torre, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
 
     elif torre_ic:
-        predio_ic = 2 if torre_ic in (6, 7) else 1
-        if predio_ic == 2:
-            titulares_mirante = [i for i, g in enumerate(grupos_finais) if tem_na_lista_original(g, lambda lk: lk[0] == 2)]
-            if titulares_mirante:
-                return min(titulares_mirante, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
-
         mesma_torre = [
             i for i, g in enumerate(grupos_finais)
-            if tem_na_lista_original(g, lambda lk: lk[:2] == (predio_ic, int(torre_ic)))
+            if tem_na_lista_original(g, lambda lk: lk[:2] == (1, int(torre_ic)))
         ]
         if mesma_torre:
             return min(mesma_torre, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
@@ -372,7 +439,9 @@ def rebalancear_fronteiras_finais(grupos_finais):
         media = sum(cargas) / k
         variancia = sum((c - media) ** 2 for c in cargas)
         amplitude = max(cargas) - min(cargas)
-        return variancia + 0.5 * (amplitude ** 2)
+        medicos_mirante = sum(1 for g in grupos_finais if any(p["loc_key"][0] == 2 for p in g))
+        penal_mirante = max(0, medicos_mirante - 1) * 200.0
+        return variancia + 0.5 * (amplitude ** 2) + penal_mirante
 
     for _ in range(60):
         melhor_obj = objetivo_global()
@@ -536,16 +605,50 @@ def extrair_dados_pdf(doc):
             "peso": peso,
             "novo": eh_novo,
             "medico_fixo": None,
+            "excluido": False,
         })
 
     return pacientes, em_cc, data_doc, rodape_info, crm_info
 
 
-def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas, admissoes_extras):
+def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw, admissoes_raw):
     doc_orig = fitz.open(stream=pdf_bytes, filetype="pdf")
     pacientes, em_cc, data_doc, rodape_info, crm_info = extrair_dados_pdf(doc_orig)
 
-    avisos_fixos = aplicar_peculiaridades(pacientes, peculiaridades, num_medicos)
+    itens_ic = []
+    for ic in interconsultas_raw:
+        itens_ic.append({
+            "origem": "IC",
+            "nome": ic["texto"],
+            "leito": ic["leito"],
+            "torre": ic["torre"],
+            "loc_key": ic["loc_key"],
+            "peso": PESO_INTERCONSULTA,
+            "novo": False,
+            "medico_fixo": None,
+            "excluido": False,
+        })
+
+    itens_adm = []
+    for adm in admissoes_raw:
+        itens_adm.append({
+            "origem": "ADM",
+            "nome": adm["texto"],
+            "leito": adm["leito"],
+            "torre": adm["torre"],
+            "loc_key": adm["loc_key"],
+            "peso": PESO_ADMISSAO_NOVA,
+            "novo": True,
+            "medico_fixo": None,
+            "excluido": False,
+        })
+
+    todos_itens = pacientes + itens_ic + itens_adm
+    avisos_fixos = aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos)
+
+    pacientes = [p for p in pacientes if not p.get("excluido")]
+    itens_ic = [ic for ic in itens_ic if not ic.get("excluido")]
+    itens_adm = [adm for adm in itens_adm if not adm.get("excluido")]
 
     fixos_por_medico = [[] for _ in range(num_medicos)]
     pacientes_livres = []
@@ -559,7 +662,7 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas, ad
             pacientes_livres.append(p)
 
     pacientes_livres.sort(key=lambda p: p["loc_key"])
-    peso_extra_global = len(interconsultas) * PESO_INTERCONSULTA + len(admissoes_extras) * PESO_ADMISSAO_NOVA
+    peso_extra_global = sum(ic["peso"] for ic in itens_ic) + sum(adm["peso"] for adm in itens_adm)
 
     grupos_livres = particionar_blocos_continuos_dp(
         pacientes_livres,
@@ -576,26 +679,25 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas, ad
             p["medico"] = idx_med + 1
             grupos_finais[idx_med].append(p)
 
+    # Ordena ICs e ADMs para processar primeiro quem já tem médico fixo ou está no Mirante
+    itens_ic_ord = sorted(
+        itens_ic,
+        key=lambda x: (0 if x["medico_fixo"] is not None else 1, 0 if x["loc_key"][0] == 2 else 1),
+    )
     ics_alocadas = []
-    for ic in interconsultas:
-        idx_med = escolher_medico_interconsulta(ic, grupos_finais)
-        grupos_finais[idx_med].append({
-            "origem": "IC",
-            "nome": ic["texto"],
-            "loc_key": ic["loc_key"],
-            "peso": PESO_INTERCONSULTA,
-        })
-        ics_alocadas.append((ic["texto"], idx_med))
+    for ic in itens_ic_ord:
+        idx_med = escolher_medico_item_extra(ic, grupos_finais)
+        grupos_finais[idx_med].append(ic)
+        ics_alocadas.append((ic, idx_med))
 
+    itens_adm_ord = sorted(
+        itens_adm,
+        key=lambda x: (0 if x["medico_fixo"] is not None else 1, 0 if x["loc_key"][0] == 2 else 1),
+    )
     adms_alocadas = []
-    for adm in admissoes_extras:
-        idx_med = min(range(num_medicos), key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
-        grupos_finais[idx_med].append({
-            "origem": "ADM",
-            "nome": adm,
-            "loc_key": (99, 99, 99, 99, 99),
-            "peso": PESO_ADMISSAO_NOVA,
-        })
+    for adm in itens_adm_ord:
+        idx_med = escolher_medico_item_extra(adm, grupos_finais)
+        grupos_finais[idx_med].append(adm)
         adms_alocadas.append((adm, idx_med))
 
     rebalancear_fronteiras_finais(grupos_finais)
@@ -673,21 +775,23 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas, ad
 
     y_cursor = y + 12
 
-    def desenhar_item_extra(texto_item, idx_med, tag_tipo):
+    def desenhar_item_extra(item_obj, idx_med, tag_tipo):
         nonlocal y_cursor
         med = idx_med + 1
         cor = CORES_MEDICOS[(med - 1) % len(CORES_MEDICOS)]
+        label_med = f"M{med}*" if item_obj.get("medico_fixo") else f"M{med}"
 
         box = fitz.Rect(24, y_cursor, largura - 24, y_cursor + 14.5)
         page.draw_rect(box, color=(0.55, 0.55, 0.55), fill=cor, width=0.5)
 
         badge = fitz.Rect(541, y_cursor + 1.2, largura - 26, y_cursor + 13.3)
         page.draw_rect(badge, color=(0.25, 0.25, 0.25), fill=(1, 1, 1), width=0.6)
-        page.insert_text((548.5, y_cursor + 10.2), f"M{med}", fontsize=8.0, fontname="hebo", color=(0.05, 0.05, 0.05))
+        x_badge = 545.5 if "*" in label_med else 548.5
+        page.insert_text((x_badge, y_cursor + 10.2), label_med, fontsize=8.0, fontname="hebo", color=(0.05, 0.05, 0.05))
 
         page.insert_text(
             (28, y_cursor + 10.5),
-            f"[{tag_tipo}] {texto_item}",
+            f"[{tag_tipo}] {item_obj['nome']}",
             fontsize=8.2,
             fontname="hebo",
             color=(0.05, 0.05, 0.05),
@@ -697,15 +801,15 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas, ad
     if ics_alocadas:
         page.insert_text((24, y_cursor + 8), "INTERCONSULTAS:", fontsize=8.5, fontname="hebo")
         y_cursor += 12
-        for texto_ic, idx_med in ics_alocadas:
-            desenhar_item_extra(texto_ic, idx_med, "IC")
+        for item_ic, idx_med in ics_alocadas:
+            desenhar_item_extra(item_ic, idx_med, "IC")
 
     if adms_alocadas:
         y_cursor += 4
         page.insert_text((24, y_cursor + 8), "ADMISSÕES EXTRAS:", fontsize=8.5, fontname="hebo")
         y_cursor += 12
-        for texto_adm, idx_med in adms_alocadas:
-            desenhar_item_extra(texto_adm, idx_med, "ADM")
+        for item_adm, idx_med in adms_alocadas:
+            desenhar_item_extra(item_adm, idx_med, "ADM")
 
     contagem_total = [len(g) for g in grupos_finais]
     y_rodape_base = altura_necessaria - 34
@@ -727,9 +831,11 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas, ad
     for i in range(num_medicos):
         c_total = calcular_carga_total_medico(grupos_finais[i])
         c_desloc = calcular_custo_deslocamento_grupo([p["loc_key"] for p in grupos_finais[i]])
+        qtd_adm = sum(1 for p in grupos_finais[i] if p.get("novo") or p.get("origem") == "ADM")
         tabela_cargas.append({
             "Médico": f"M{i+1}",
             "Pacientes": contagem_total[i],
+            "Admissões": qtd_adm,
             "Deslocamento": f"+{c_desloc:.2f}",
             "Carga Total": round(c_total, 2),
         })
@@ -745,7 +851,7 @@ arquivo_pdf = st.file_uploader("1. Envie o PDF da lista de internados", type=["p
 num_medicos = st.number_input("2. Número de médicos hoje", min_value=2, max_value=12, value=7, step=1)
 
 peculiaridades_txt = st.text_area(
-    "3. Peculiaridades / Fixos / Exclusões do dia (opcional)",
+    "3. Peculiaridades / Fixos / Exclusões (vale para lista, ICs e admissões)",
     placeholder="Ex: M3: Paciente A, Paciente B\nExcluir: Paciente C, 1310 01",
     height=85,
 )
@@ -757,32 +863,39 @@ interconsultas_txt = st.text_area(
 )
 
 linhas_ic_raw = [l.strip() for l in interconsultas_txt.splitlines() if l.strip()]
-interconsultas_parsed = interpretar_interconsultas_whatsapp(linhas_ic_raw)
+interconsultas_parsed = interpretar_texto_livre_pacientes(linhas_ic_raw, prefixo_strip_regex=r"^\[IC\]\s*")
 
 if interconsultas_parsed:
-    with st.expander(f"🔎 Prévia da leitura das interconsultas ({len(interconsultas_parsed)} detectadas)", expanded=True):
+    with st.expander(f"🔎 Prévia das interconsultas ({len(interconsultas_parsed)} detectadas)", expanded=True):
         for idx, ic in enumerate(interconsultas_parsed, start=1):
             st.markdown(f"**{idx}.** `{ic['texto']}` → {ic['descricao_loc']}")
 
 admissoes_txt = st.text_area(
     "5. Admissões extras que ainda não subiram no sistema (opcional)",
-    placeholder="Ex: Paciente Exemplo - Equipe",
-    height=75,
+    placeholder="Ex: Claudete - Hemo\nFulano - UTIE 02\nBeltrano - 2S",
+    height=85,
 )
+
+linhas_adm_raw = [l.strip() for l in admissoes_txt.splitlines() if l.strip()]
+admissoes_parsed = interpretar_texto_livre_pacientes(linhas_adm_raw, prefixo_strip_regex=r"^\[ADM\]\s*")
+
+if admissoes_parsed:
+    with st.expander(f"🔎 Prévia das admissões extras ({len(admissoes_parsed)} detectadas)", expanded=True):
+        for idx, adm in enumerate(admissoes_parsed, start=1):
+            st.markdown(f"**{idx}.** `{adm['texto']}` → {adm['descricao_loc']}")
 
 if st.button("Gerar Divisão", type="primary", use_container_width=True):
     if not arquivo_pdf:
         st.error("Por favor, envie o arquivo PDF da lista primeiro.")
     else:
         peculiaridades = [l.strip() for l in peculiaridades_txt.splitlines() if l.strip()]
-        admissoes_extras = [l.strip() for l in admissoes_txt.splitlines() if l.strip()]
 
         pdf_out, png_out, resumo_txt, tabela_cargas, avisos_fixos = processar_divisao(
             arquivo_pdf.read(),
             int(num_medicos),
             peculiaridades,
             interconsultas_parsed,
-            admissoes_extras,
+            admissoes_parsed,
         )
 
         if avisos_fixos:
