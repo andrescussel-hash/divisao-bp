@@ -93,6 +93,11 @@ def chave_localizacao(leito: str):
         num = int(re.sub(r"\D", "", re.sub(r"^UTI\s*1A", "", leito_clean)) or 0)
         return (1, 1, 1, num, 0)
 
+    # ISOL 01, 02, 03 -> Leitos da UTI no 1600 (Torre 1, 6º andar)
+    if leito_clean.startswith("ISOL"):
+        num = int(re.sub(r"\D", "", leito_clean) or 0)
+        return (1, 1, 6, 50 + num, 0)
+
     # PREXA / Hemodinâmica / 2º Subsolo -> Torre 4, andar -2 (entre Torres 3 e 5)
     if (
         "PREXA" in leito_clean
@@ -102,13 +107,12 @@ def chave_localizacao(leito: str):
         num = int(re.sub(r"\D", "", re.sub(r"^2S", "", leito_clean)) or 0)
         return (1, 4, -2, num, 0)
 
-    # UIH / ISOL -> Paulista, Torre 5, térreo
-    if leito_clean.startswith("UIH") or leito_clean.startswith("ISOL"):
+    # UIH -> Paulista, Torre 5, térreo
+    if leito_clean.startswith("UIH"):
         nums = re.findall(r"\d+", leito_clean)
         unidade = int(nums[0]) if len(nums) >= 1 else 1
         leito_num = int(nums[1]) if len(nums) >= 2 else 0
-        prefixo_ord = 100 if leito_clean.startswith("UIH") else 200
-        return (1, 5, 0, prefixo_ord * unidade + leito_num, 0)
+        return (1, 5, 0, 100 * unidade + leito_num, 0)
 
     # Leitos padrão 1000..7999
     m = re.match(r"^(\d)(\d)(\d{2})(?:[-\s]+(\d+))?$", leito_clean)
@@ -165,6 +169,9 @@ def interpretar_texto_livre_pacientes(linhas, prefixo_strip_regex=None):
             elif leito_detectado.startswith("UTI 1A") or leito_detectado.startswith("UTI1A"):
                 torre_linha = 1
                 descricao_loc = f"{leito_detectado} (Torre 1, 1º andar - UTI 1A)"
+            elif leito_detectado.startswith("ISOL"):
+                torre_linha = 1
+                descricao_loc = f"{leito_detectado} (UTI 1600 - Torre 1, 6º andar)"
             elif loc_key[0] in (1, 2):
                 torre_linha = loc_key[1]
                 predio_lbl = "Mirante" if loc_key[0] == 2 else f"Torre {loc_key[1]}"
@@ -240,12 +247,15 @@ def calcular_carga_total_medico(grupo_pacientes):
     return peso_pacs + custo_desloc
 
 
+def contar_admissoes_grupo(grupo_pacientes):
+    return sum(1 for p in grupo_pacientes if p.get("novo") or p.get("origem") == "ADM")
+
+
 def leito_compacto_prefixo(leito_norm: str, prefixos: tuple) -> bool:
     return any(leito_norm.startswith(p) for p in prefixos)
 
 
 def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
-    """Verifica se o termo se refere a um setor/torre/andar inteiro (ex: mirante, prexa, torre 4, 1700, utie)."""
     lk = item["loc_key"]
     leito_norm = normalizar_texto(item.get("leito", "")).replace(" ", "")
     termo_compacto = termo_norm.replace(" ", "").replace("-", "")
@@ -262,8 +272,11 @@ def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
     if termo_compacto in ("uti1a",):
         return leito_norm.startswith("uti1a")
 
-    if termo_compacto in ("uih", "isol"):
-        return leito_norm.startswith(termo_compacto)
+    if termo_compacto in ("isol", "uti1600"):
+        return leito_norm.startswith("isol")
+
+    if termo_compacto in ("uih",):
+        return leito_norm.startswith("uih")
 
     m_torre = re.fullmatch(r"(?:torre|t)\s*([1-7])", termo_norm)
     if m_torre:
@@ -282,12 +295,6 @@ def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
 
 
 def _analisar_componente_peculiaridade(termo: str):
-    """
-    Extrai separadamente da expressão:
-      - na: Número de Atendimento (6+ dígitos, ex: 12345678)
-      - leito: Leito informado (ex: '1700 01', 'UTIE 05'), que pode estar desatualizado na planilha
-      - nome: Nome do paciente (ex: 'Fulano de Tal')
-    """
     termo_clean = re.sub(r"\s+", " ", termo.replace("\t", " ")).strip(" .:-–—>")
     if not termo_clean:
         return None, None, ""
@@ -331,16 +338,6 @@ def _casar_leito_item(leito_busca: str, item: dict) -> bool:
 
 
 def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
-    """
-    Suporta comandos persistentes entre linhas (Enter):
-      - Excluir / Exclua (mantém exclusão nas linhas seguintes até outro comando)
-      - M1 / M2 ... (mantém fixação no médico indicado nas linhas seguintes)
-      - Mesma equipe / Mesmo médico / Juntos (mantém os pacientes listados juntos no mesmo médico)
-    Prioridade de busca por paciente:
-      1) Número de Atendimento (NA), se fornecido (único por paciente)
-      2) Nome do paciente (ignora divergência de leito caso a planilha esteja desatualizada, usando leito apenas para desempatar homônimos)
-      3) Setor/torre/andar ou leito isolado (quando nenhum nome ou NA foi fornecido na linha)
-    """
     avisos = []
     grupos_juntos = []
 
@@ -377,7 +374,6 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
             avisos.append(f"Não identifiquei qual médico ou ação na regra: '{linha}'")
             continue
 
-        # Preserva 'de/da/do/das/dos' para não quebrar nomes compostos
         resto = re.sub(r"\b(?:m|med|medico|médico)\s*\d+\b", " ", linha, flags=re.IGNORECASE)
         resto = re.sub(
             r"\b(?:excluir|exclui|exclua|tirar|tira|tire|remover|remove|remova|alta|óbito|obito|ignorar|ignore|retirar|retire|deixar|colocar|ficar|manter|juntos|juntar|agrupar|mesmo|mesma|equipe|com|para|no|na|nos|nas|o|a|os|as|paciente|pacientes|leito|leitos|localizacao|localização|setor|pq|porque|ele|ela|quer|ver|esse|essa|esses|essas|em|lista|ic|interconsulta|admissao|admissão|na)\b",
@@ -399,14 +395,12 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
             candidatos_ativos = [it for it in todos_itens if not it.get("excluido")]
             selecionados = []
 
-            # 1) Busca por NA (identificador único do paciente)
             if na_busca:
                 selecionados = [
                     it for it in candidatos_ativos
                     if na_busca in it.get("atendimento", "") or na_busca in it.get("nome", "")
                 ]
 
-            # 2) Se não achou por NA (ou não veio NA), busca pelo Nome (mesmo se o leito da planilha estiver desatualizado)
             if not selecionados and nome_busca:
                 nome_busca_norm = normalizar_texto(nome_busca)
                 setor_matches = [it for it in candidatos_ativos if _casar_setor_ou_localizacao(nome_busca_norm, it)]
@@ -420,7 +414,6 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
                     else:
                         selecionados = nome_matches
 
-            # 3) Fallback pelo leito apenas se nenhum nome nem NA foi informado na linha
             if not selecionados and not na_busca and not nome_busca and leito_busca:
                 leito_busca_norm = normalizar_texto(leito_busca)
                 setor_matches = [it for it in candidatos_ativos if _casar_setor_ou_localizacao(leito_busca_norm, it)]
@@ -459,19 +452,22 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
     return avisos, grupos_juntos
 
 
-def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extra_global=0.0):
+def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extra_global=0.0, total_adm_global=0):
     n = len(itens_livres)
     if n == 0:
         return [[] for _ in range(k)]
 
     pesos = [item["peso"] for item in itens_livres]
     prefixo_peso = [0.0] * (n + 1)
+    prefixo_adm = [0] * (n + 1)
     for i in range(n):
         prefixo_peso[i + 1] = prefixo_peso[i] + pesos[i]
+        prefixo_adm[i + 1] = prefixo_adm[i] + (1 if itens_livres[i].get("novo") else 0)
 
     peso_fixo_total = sum(sum(p["peso"] for p in g) for g in fixos_por_medico)
     custo_desloc_estimado = (k - 1) * 0.35 + (CUSTO_DESLOC_MIRANTE if any(x["loc_key"][0] == 2 for x in itens_livres) else 0.0)
     carga_ideal = (prefixo_peso[n] + peso_fixo_total + peso_extra_global + custo_desloc_estimado) / k
+    adm_ideal = total_adm_global / k if k > 0 else 0.0
 
     dp = [[float("inf")] * (n + 1) for _ in range(k + 1)]
     corte = [[0] * (n + 1) for _ in range(k + 1)]
@@ -480,6 +476,7 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
     for j in range(1, k + 1):
         fixos_med = fixos_por_medico[j - 1]
         peso_fixo_med = sum(p["peso"] for p in fixos_med)
+        adm_fixo_med = contar_admissoes_grupo(fixos_med)
         locs_fixas_med = [p["loc_key"] for p in fixos_med]
 
         for i in range(0, n + 1):
@@ -492,6 +489,7 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
 
                 bloco = itens_livres[p:i]
                 soma_pacientes = prefixo_peso[i] - prefixo_peso[p]
+                qtd_adm_med = adm_fixo_med + (prefixo_adm[i] - prefixo_adm[p])
                 locs_bloco = locs_fixas_med + [x["loc_key"] for x in bloco]
                 custo_desloc = calcular_custo_deslocamento_grupo(locs_bloco)
 
@@ -506,7 +504,10 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
                     if loc_ant[0] == 2 and loc_ini[0] == 2:
                         penalidade_corte_andar += 200.0
 
-                custo = dp[j - 1][p] + ((carga_total_med - carga_ideal) ** 2) * 2.0 + penalidade_corte_andar
+                # Penalidade suave para evitar concentrar todas as admissões novas em poucos médicos
+                penalidade_adm = ((qtd_adm_med - adm_ideal) ** 2) * 0.65
+
+                custo = dp[j - 1][p] + ((carga_total_med - carga_ideal) ** 2) * 2.0 + penalidade_adm + penalidade_corte_andar
                 if custo < dp[j][i]:
                     dp[j][i] = custo
                     corte[j][i] = p
@@ -527,6 +528,14 @@ def escolher_medico_item_extra(item, grupos_finais):
 
     loc_ic = item["loc_key"]
     torre_ic = item.get("torre")
+    eh_adm = bool(item.get("novo") or item.get("origem") == "ADM")
+
+    def score_escolha(i):
+        # Prioriza menor carga total e, como segundo critério, quem tem menos admissões novas
+        return (
+            calcular_carga_total_medico(grupos_finais[i]),
+            contar_admissoes_grupo(grupos_finais[i]) if eh_adm else 0,
+        )
 
     def tem_na_lista_original(grupo, pred):
         return any(p.get("origem") == "PDF" and pred(p["loc_key"]) for p in grupo)
@@ -538,8 +547,8 @@ def escolher_medico_item_extra(item, grupos_finais):
     if eh_mirante:
         ja_no_mirante = [i for i, g in enumerate(grupos_finais) if ja_tem_qualquer_no_mirante(g)]
         if ja_no_mirante:
-            return min(ja_no_mirante, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
-        return min(range(len(grupos_finais)), key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
+            return min(ja_no_mirante, key=score_escolha)
+        return min(range(len(grupos_finais)), key=score_escolha)
 
     if loc_ic[0] == 1:
         predio_ic, eixo_torre, andar_ic, quarto_ic, _ = loc_ic
@@ -550,7 +559,7 @@ def escolher_medico_item_extra(item, grupos_finais):
                 if tem_na_lista_original(g, lambda lk: lk[0] == 1 and lk[1] in (3, 4, 5))
             ]
             if no_eixo_3_5:
-                return min(no_eixo_3_5, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
+                return min(no_eixo_3_5, key=score_escolha)
 
         if quarto_ic != 50 and andar_ic >= 0:
             mesmo_quarto = [
@@ -558,21 +567,21 @@ def escolher_medico_item_extra(item, grupos_finais):
                 if tem_na_lista_original(g, lambda lk: lk[:4] == (predio_ic, eixo_torre, andar_ic, quarto_ic))
             ]
             if mesmo_quarto:
-                return min(mesmo_quarto, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
+                return min(mesmo_quarto, key=score_escolha)
 
             mesmo_andar = [
                 i for i, g in enumerate(grupos_finais)
                 if tem_na_lista_original(g, lambda lk: lk[:3] == (predio_ic, eixo_torre, andar_ic))
             ]
             if mesmo_andar:
-                return min(mesmo_andar, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
+                return min(mesmo_andar, key=score_escolha)
 
         mesma_torre = [
             i for i, g in enumerate(grupos_finais)
             if tem_na_lista_original(g, lambda lk: lk[:2] == (predio_ic, eixo_torre))
         ]
         if mesma_torre:
-            return min(mesma_torre, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
+            return min(mesma_torre, key=score_escolha)
 
     elif torre_ic:
         mesma_torre = [
@@ -580,9 +589,9 @@ def escolher_medico_item_extra(item, grupos_finais):
             if tem_na_lista_original(g, lambda lk: lk[:2] == (1, int(torre_ic)))
         ]
         if mesma_torre:
-            return min(mesma_torre, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
+            return min(mesma_torre, key=score_escolha)
 
-    return min(range(len(grupos_finais)), key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
+    return min(range(len(grupos_finais)), key=score_escolha)
 
 
 def resolver_grupos_juntos(grupos_juntos, grupos_finais):
@@ -626,9 +635,14 @@ def rebalancear_fronteiras_finais(grupos_finais):
         media = sum(cargas) / k
         variancia = sum((c - media) ** 2 for c in cargas)
         amplitude = max(cargas) - min(cargas)
+
+        adms = [contar_admissoes_grupo(g) for g in grupos_finais]
+        media_adm = sum(adms) / k
+        variancia_adm = sum((a - media_adm) ** 2 for a in adms)
+
         medicos_mirante = sum(1 for g in grupos_finais if any(p["loc_key"][0] == 2 for p in g))
         penal_mirante = max(0, medicos_mirante - 1) * 200.0
-        return variancia + 0.5 * (amplitude ** 2) + penal_mirante
+        return variancia + 0.5 * (amplitude ** 2) + 0.45 * variancia_adm + penal_mirante
 
     for _ in range(60):
         melhor_obj = objetivo_global()
@@ -850,12 +864,14 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw
 
     pacientes_livres.sort(key=lambda p: p["loc_key"])
     peso_extra_global = sum(ic["peso"] for ic in itens_ic) + sum(adm["peso"] for adm in itens_adm)
+    total_adm_global = sum(1 for p in pacientes if p.get("novo")) + len(itens_adm)
 
     grupos_livres = particionar_blocos_continuos_dp(
         pacientes_livres,
         fixos_por_medico,
         num_medicos,
         peso_extra_global=peso_extra_global,
+        total_adm_global=total_adm_global,
     )
 
     grupos_finais = [[] for _ in range(num_medicos)]
@@ -1027,7 +1043,7 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw
     for i in range(num_medicos):
         c_total = calcular_carga_total_medico(grupos_finais[i])
         c_desloc = calcular_custo_deslocamento_grupo([p["loc_key"] for p in grupos_finais[i]])
-        qtd_adm = sum(1 for p in grupos_finais[i] if p.get("novo") or p.get("origem") == "ADM")
+        qtd_adm = contar_admissoes_grupo(grupos_finais[i])
         tabela_cargas.append({
             "Médico": f"M{i+1}",
             "Pacientes": contagem_total[i],
@@ -1039,85 +1055,4 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw
     return pdf_out, png_out, resumo_txt, tabela_cargas, avisos_fixos
 
 
-# --- Interface Web (Streamlit) ---
-st.title("🏥 Divisão de Internados - BP")
-st.caption("Distribuição geográfica por torre, andar e carga de deslocamento.")
-
-arquivo_pdf = st.file_uploader("1. Envie o PDF da lista de internados", type=["pdf"])
-num_medicos = st.number_input("2. Número de médicos hoje", min_value=2, max_value=12, value=7, step=1)
-
-peculiaridades_txt = st.text_area(
-    "3. Peculiaridades / Fixos / Exclusões (mantém a ação nas linhas abaixo até novo comando)",
-    placeholder="Ex:\nExclua\n1700-01\tFulano de Tal\n12345678\tBeltrano da Silva\n\nM1\nMirante\n\nManter Ciclano e Beltrano com o mesmo médico",
-    height=120,
-)
-
-interconsultas_txt = st.text_area(
-    "4. Interconsultas (cole direto do WhatsApp)",
-    placeholder="Cole aqui o texto com emojis e torres...",
-    height=140,
-)
-
-linhas_ic_raw = [l.strip() for l in interconsultas_txt.splitlines() if l.strip()]
-interconsultas_parsed = interpretar_texto_livre_pacientes(linhas_ic_raw, prefixo_strip_regex=r"^\[IC\]\s*")
-
-if interconsultas_parsed:
-    with st.expander(f"🔎 Prévia das interconsultas ({len(interconsultas_parsed)} detectadas)", expanded=True):
-        for idx, ic in enumerate(interconsultas_parsed, start=1):
-            st.markdown(f"**{idx}.** `{ic['texto']}` → {ic['descricao_loc']}")
-
-admissoes_txt = st.text_area(
-    "5. Admissões extras que ainda não subiram no sistema (opcional)",
-    placeholder="Ex: Maria da Silva - Hemo\nJoão Souza - PS\nAna Pereira - 2S",
-    height=85,
-)
-
-linhas_adm_raw = [l.strip() for l in admissoes_txt.splitlines() if l.strip()]
-admissoes_parsed = interpretar_texto_livre_pacientes(linhas_adm_raw, prefixo_strip_regex=r"^\[ADM\]\s*")
-
-if admissoes_parsed:
-    with st.expander(f"🔎 Prévia das admissões extras ({len(admissoes_parsed)} detectadas)", expanded=True):
-        for idx, adm in enumerate(admissoes_parsed, start=1):
-            st.markdown(f"**{idx}.** `{adm['texto']}` → {adm['descricao_loc']}")
-
-if st.button("Gerar Divisão", type="primary", use_container_width=True):
-    if not arquivo_pdf:
-        st.error("Por favor, envie o arquivo PDF da lista primeiro.")
-    else:
-        peculiaridades = [l.strip() for l in peculiaridades_txt.splitlines() if l.strip()]
-
-        pdf_out, png_out, resumo_txt, tabela_cargas, avisos_fixos = processar_divisao(
-            arquivo_pdf.read(),
-            int(num_medicos),
-            peculiaridades,
-            interconsultas_parsed,
-            admissoes_parsed,
-        )
-
-        if avisos_fixos:
-            for av in avisos_fixos:
-                st.info(av)
-
-        st.success(resumo_txt)
-        st.image(png_out, caption="Lista Dividida - Pronta para compartilhar", use_container_width=True)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                "📥 Baixar Imagem (PNG)",
-                data=png_out,
-                file_name="lista_dividida.png",
-                mime="image/png",
-                use_container_width=True,
-            )
-        with col2:
-            st.download_button(
-                "📄 Baixar PDF",
-                data=pdf_out,
-                file_name="lista_dividida.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-
-        with st.expander("📊 Detalhamento de carga e deslocamento por médico"):
-            st.table(tabela_cargas)
+# ---
