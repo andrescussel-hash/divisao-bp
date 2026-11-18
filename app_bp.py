@@ -1055,4 +1055,85 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw
     return pdf_out, png_out, resumo_txt, tabela_cargas, avisos_fixos
 
 
-# ---
+# --- Interface Web (Streamlit) ---
+st.title("🏥 Divisão de Internados - BP")
+st.caption("Distribuição geográfica por torre, andar e carga de deslocamento.")
+
+arquivo_pdf = st.file_uploader("1. Envie o PDF da lista de internados", type=["pdf"])
+num_medicos = st.number_input("2. Número de médicos hoje", min_value=2, max_value=12, value=7, step=1)
+
+peculiaridades_txt = st.text_area(
+    "3. Peculiaridades / Fixos / Exclusões (mantém a ação nas linhas abaixo até novo comando)",
+    placeholder="Ex:\nExclua\n1700-01\tFulano de Tal\n12345678\tBeltrano da Silva\n\nM1\nMirante\n\nManter Ciclano e Beltrano com o mesmo médico",
+    height=120,
+)
+
+interconsultas_txt = st.text_area(
+    "4. Interconsultas (cole direto do WhatsApp)",
+    placeholder="Cole aqui o texto com emojis e torres...",
+    height=140,
+)
+
+linhas_ic_raw = [l.strip() for l in interconsultas_txt.splitlines() if l.strip()]
+interconsultas_parsed = interpretar_texto_livre_pacientes(linhas_ic_raw, prefixo_strip_regex=r"^\[IC\]\s*")
+
+if interconsultas_parsed:
+    with st.expander(f"🔎 Prévia das interconsultas ({len(interconsultas_parsed)} detectadas)", expanded=True):
+        for idx, ic in enumerate(interconsultas_parsed, start=1):
+            st.markdown(f"**{idx}.** `{ic['texto']}` → {ic['descricao_loc']}")
+
+admissoes_txt = st.text_area(
+    "5. Admissões extras que ainda não subiram no sistema (opcional)",
+    placeholder="Ex: Maria da Silva - Hemo\nJoão Souza - PS\nAna Pereira - 2S",
+    height=85,
+)
+
+linhas_adm_raw = [l.strip() for l in admissoes_txt.splitlines() if l.strip()]
+admissoes_parsed = interpretar_texto_livre_pacientes(linhas_adm_raw, prefixo_strip_regex=r"^\[ADM\]\s*")
+
+if admissoes_parsed:
+    with st.expander(f"🔎 Prévia das admissões extras ({len(admissoes_parsed)} detectadas)", expanded=True):
+        for idx, adm in enumerate(admissoes_parsed, start=1):
+            st.markdown(f"**{idx}.** `{adm['texto']}` → {adm['descricao_loc']}")
+
+if st.button("Gerar Divisão", type="primary", use_container_width=True):
+    if not arquivo_pdf:
+        st.error("Por favor, envie o arquivo PDF da lista primeiro.")
+    else:
+        peculiaridades = [l.strip() for l in peculiaridades_txt.splitlines() if l.strip()]
+
+        pdf_out, png_out, resumo_txt, tabela_cargas, avisos_fixos = processar_divisao(
+            arquivo_pdf.read(),
+            int(num_medicos),
+            peculiaridades,
+            interconsultas_parsed,
+            admissoes_parsed,
+        )
+
+        if avisos_fixos:
+            for av in avisos_fixos:
+                st.info(av)
+
+        st.success(resumo_txt)
+        st.image(png_out, caption="Lista Dividida - Pronta para compartilhar", use_container_width=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "📥 Baixar Imagem (PNG)",
+                data=png_out,
+                file_name="lista_dividida.png",
+                mime="image/png",
+                use_container_width=True,
+            )
+        with col2:
+            st.download_button(
+                "📄 Baixar PDF",
+                data=pdf_out,
+                file_name="lista_dividida.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
+        with st.expander("📊 Detalhamento de carga e deslocamento por médico"):
+            st.table(tabela_cargas)
