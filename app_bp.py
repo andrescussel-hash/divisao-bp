@@ -10,7 +10,7 @@ st.set_page_config(
     layout="centered",
 )
 
-# Parâmetros clínicos de carga e deslocamento (v2.4)
+# Parâmetros clínicos de carga e deslocamento
 PESO_PACIENTE_PADRAO = 1.0
 PESO_ADMISSAO_NOVA = 1.5
 PESO_INTERCONSULTA = 1.0
@@ -284,21 +284,19 @@ def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
 def _analisar_componente_peculiaridade(termo: str):
     """
     Extrai separadamente da expressão:
-      - na: Número de Atendimento (7 a 10 dígitos, ex: 21241667)
+      - na: Número de Atendimento (6+ dígitos, ex: 12345678)
       - leito: Leito informado (ex: '1700 01', 'UTIE 05'), que pode estar desatualizado na planilha
-      - nome: Nome do paciente (ex: 'Nahime Ibrahim Ozi')
+      - nome: Nome do paciente (ex: 'Fulano de Tal')
     """
     termo_clean = re.sub(r"\s+", " ", termo.replace("\t", " ")).strip(" .:-–—>")
     if not termo_clean:
         return None, None, ""
 
-    # 1. Extrai Número de Atendimento (NA: sequência de 6+ dígitos)
     m_na = re.search(r"\b(\d{6,})\b", termo_clean)
     na_detectado = m_na.group(1) if m_na else None
     sem_na = re.sub(r"\b\d{6,}\b", " ", termo_clean).strip(" .:-–—>")
     sem_na = re.sub(r"\s+", " ", sem_na)
 
-    # 2. Extrai leito (no início ou no fim)
     leito_detectado = None
     nome_parte = sem_na
 
@@ -379,7 +377,7 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
             avisos.append(f"Não identifiquei qual médico ou ação na regra: '{linha}'")
             continue
 
-        # Preserva 'de/da/do/das/dos' para não quebrar nomes compostos como 'Jose do Carmo Ribeiro'
+        # Preserva 'de/da/do/das/dos' para não quebrar nomes compostos
         resto = re.sub(r"\b(?:m|med|medico|médico)\s*\d+\b", " ", linha, flags=re.IGNORECASE)
         resto = re.sub(
             r"\b(?:excluir|exclui|exclua|tirar|tira|tire|remover|remove|remova|alta|óbito|obito|ignorar|ignore|retirar|retire|deixar|colocar|ficar|manter|juntos|juntar|agrupar|mesmo|mesma|equipe|com|para|no|na|nos|nas|o|a|os|as|paciente|pacientes|leito|leitos|localizacao|localização|setor|pq|porque|ele|ela|quer|ver|esse|essa|esses|essas|em|lista|ic|interconsulta|admissao|admissão|na)\b",
@@ -411,20 +409,18 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
             # 2) Se não achou por NA (ou não veio NA), busca pelo Nome (mesmo se o leito da planilha estiver desatualizado)
             if not selecionados and nome_busca:
                 nome_busca_norm = normalizar_texto(nome_busca)
-                # Verifica primeiro se o "nome" na verdade é um setor (ex: "Mirante", "PREXA", "Torre 4")
                 setor_matches = [it for it in candidatos_ativos if _casar_setor_ou_localizacao(nome_busca_norm, it)]
                 if setor_matches:
                     selecionados = setor_matches
                 elif len(nome_busca_norm) >= 3:
                     nome_matches = [it for it in candidatos_ativos if nome_busca_norm in normalizar_texto(it["nome"])]
                     if len(nome_matches) > 1 and leito_busca:
-                        # Desempata homônimos pelo leito, se houver
                         desempate = [it for it in nome_matches if _casar_leito_item(leito_busca, it)]
                         selecionados = desempate if desempate else nome_matches
                     else:
                         selecionados = nome_matches
 
-            # 3) Fallback pelo leito apenas se nenhum nome nem NA foi informado na linha (ex: linha só com "1700-01")
+            # 3) Fallback pelo leito apenas se nenhum nome nem NA foi informado na linha
             if not selecionados and not na_busca and not nome_busca and leito_busca:
                 leito_busca_norm = normalizar_texto(leito_busca)
                 setor_matches = [it for it in candidatos_ativos if _casar_setor_ou_localizacao(leito_busca_norm, it)]
@@ -1052,7 +1048,7 @@ num_medicos = st.number_input("2. Número de médicos hoje", min_value=2, max_va
 
 peculiaridades_txt = st.text_area(
     "3. Peculiaridades / Fixos / Exclusões (mantém a ação nas linhas abaixo até novo comando)",
-    placeholder="Ex:\nExclua\n1700-01\tNahime Ibrahim Ozi\n21241667\tEsmael Martins\n\nM1\nMirante\n\nManter Fulano e Beltrano com o mesmo médico",
+    placeholder="Ex:\nExclua\n1700-01\tFulano de Tal\n12345678\tBeltrano da Silva\n\nM1\nMirante\n\nManter Ciclano e Beltrano com o mesmo médico",
     height=120,
 )
 
@@ -1072,7 +1068,7 @@ if interconsultas_parsed:
 
 admissoes_txt = st.text_area(
     "5. Admissões extras que ainda não subiram no sistema (opcional)",
-    placeholder="Ex: Claudete - Hemo\nAval surto psicótico - PS\nBeltrano - 2S",
+    placeholder="Ex: Maria da Silva - Hemo\nJoão Souza - PS\nAna Pereira - 2S",
     height=85,
 )
 
