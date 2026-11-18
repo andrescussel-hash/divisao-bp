@@ -12,7 +12,7 @@ st.set_page_config(
 
 # Parâmetros clínicos de carga e deslocamento
 PESO_PACIENTE_PADRAO = 1.0
-PESO_ADMISSAO_NOVA = 1.5
+PESO_ADMISSAO_NOVA = 1.5         # +0.5 adicional por admissão nova
 PESO_INTERCONSULTA = 1.0
 
 CUSTO_DESLOC_MIRANTE = 1.0       # +1.0 pelo deslocamento entre prédios (Paulista <-> Mirante)
@@ -452,7 +452,14 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
     return avisos, grupos_juntos
 
 
-def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extra_global=0.0, total_adm_global=0):
+def particionar_blocos_continuos_dp(
+    itens_livres,
+    fixos_por_medico,
+    k,
+    peso_extra_global=0.0,
+    qtd_extra_global=0,
+    total_adm_global=0,
+):
     n = len(itens_livres)
     if n == 0:
         return [[] for _ in range(k)]
@@ -465,8 +472,13 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
         prefixo_adm[i + 1] = prefixo_adm[i] + (1 if itens_livres[i].get("novo") else 0)
 
     peso_fixo_total = sum(sum(p["peso"] for p in g) for g in fixos_por_medico)
+    qtd_fixa_total = sum(len(g) for g in fixos_por_medico)
+
     custo_desloc_estimado = (k - 1) * 0.35 + (CUSTO_DESLOC_MIRANTE if any(x["loc_key"][0] == 2 for x in itens_livres) else 0.0)
+
+    # Metas na hierarquia: 1) Carga Total, 2) Número de Pacientes, 3) Admissões
     carga_ideal = (prefixo_peso[n] + peso_fixo_total + peso_extra_global + custo_desloc_estimado) / k
+    qtd_pacs_ideal = (n + qtd_fixa_total + qtd_extra_global) / k
     adm_ideal = total_adm_global / k if k > 0 else 0.0
 
     dp = [[float("inf")] * (n + 1) for _ in range(k + 1)]
@@ -476,6 +488,7 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
     for j in range(1, k + 1):
         fixos_med = fixos_por_medico[j - 1]
         peso_fixo_med = sum(p["peso"] for p in fixos_med)
+        qtd_fixo_med = len(fixos_med)
         adm_fixo_med = contar_admissoes_grupo(fixos_med)
         locs_fixas_med = [p["loc_key"] for p in fixos_med]
 
@@ -489,10 +502,11 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
 
                 bloco = itens_livres[p:i]
                 soma_pacientes = prefixo_peso[i] - prefixo_peso[p]
+                qtd_pacs_med = qtd_fixo_med + (i - p)
                 qtd_adm_med = adm_fixo_med + (prefixo_adm[i] - prefixo_adm[p])
+
                 locs_bloco = locs_fixas_med + [x["loc_key"] for x in bloco]
                 custo_desloc = calcular_custo_deslocamento_grupo(locs_bloco)
-
                 carga_total_med = peso_fixo_med + soma_pacientes + custo_desloc
 
                 penalidade_corte_andar = 0.0
@@ -504,10 +518,13 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
                     if loc_ant[0] == 2 and loc_ini[0] == 2:
                         penalidade_corte_andar += 200.0
 
-                # Penalidade suave para evitar concentrar todas as admissões novas em poucos médicos
-                penalidade_adm = ((qtd_adm_med - adm_ideal) ** 2) * 0.65
+                # Hierarquia estrita de equilíbrio:
+                # 1º Carga Total (peso 2.5) > 2º Número de Pacientes (peso 0.9) > 3º Admissões (peso 0.25)
+                custo_carga = ((carga_total_med - carga_ideal) ** 2) * 2.5
+                custo_qtd = ((qtd_pacs_med - qtd_pacs_ideal) ** 2) * 0.9
+                custo_adm = ((qtd_adm_med - adm_ideal) ** 2) * 0.25
 
-                custo = dp[j - 1][p] + ((carga_total_med - carga_ideal) ** 2) * 2.0 + penalidade_adm + penalidade_corte_andar
+                custo = dp[j - 1][p] + custo_carga + custo_qtd + custo_adm + penalidade_corte_andar
                 if custo < dp[j][i]:
                     dp[j][i] = custo
                     corte[j][i] = p
@@ -531,9 +548,10 @@ def escolher_medico_item_extra(item, grupos_finais):
     eh_adm = bool(item.get("novo") or item.get("origem") == "ADM")
 
     def score_escolha(i):
-        # Prioriza menor carga total e, como segundo critério, quem tem menos admissões novas
+        # Hierarquia: 1º Carga Total, 2º Número de Pacientes, 3º Admissões (se o item for admissão)
         return (
-            calcular_carga_total_medico(grupos_finais[i]),
+            round(calcular_carga_total_medico(grupos_finais[i]), 2),
+            len(grupos_finais[i]),
             contar_admissoes_grupo(grupos_finais[i]) if eh_adm else 0,
         )
 
@@ -614,7 +632,10 @@ def resolver_grupos_juntos(grupos_juntos, grupos_finais):
                 if med_escolhido is not None:
                     break
         if med_escolhido is None:
-            med_escolhido = min(range(len(grupos_finais)), key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
+            med_escolhido = min(
+                range(len(grupos_finais)),
+                key=lambda i: (round(calcular_carga_total_medico(grupos_finais[i]), 2), len(grupos_finais[i])),
+            )
 
         for it in ativos:
             for g in grupos_finais:
@@ -631,18 +652,33 @@ def rebalancear_fronteiras_finais(grupos_finais):
         return
 
     def objetivo_global():
+        # 1º Prioridade: Carga Total (variância + amplitude)
         cargas = [calcular_carga_total_medico(g) for g in grupos_finais]
-        media = sum(cargas) / k
-        variancia = sum((c - media) ** 2 for c in cargas)
-        amplitude = max(cargas) - min(cargas)
+        media_c = sum(cargas) / k
+        var_carga = sum((c - media_c) ** 2 for c in cargas)
+        amp_carga = max(cargas) - min(cargas)
 
+        # 2º Prioridade: Número de Pacientes por médico
+        qtds = [len(g) for g in grupos_finais]
+        media_q = sum(qtds) / k
+        var_qtd = sum((q - media_q) ** 2 for q in qtds)
+        amp_qtd = max(qtds) - min(qtds)
+
+        # 3º Prioridade: Distribuição de Admissões
         adms = [contar_admissoes_grupo(g) for g in grupos_finais]
-        media_adm = sum(adms) / k
-        variancia_adm = sum((a - media_adm) ** 2 for a in adms)
+        media_a = sum(adms) / k
+        var_adm = sum((a - media_a) ** 2 for a in adms)
 
+        # Restrição absoluta do Mirante
         medicos_mirante = sum(1 for g in grupos_finais if any(p["loc_key"][0] == 2 for p in g))
         penal_mirante = max(0, medicos_mirante - 1) * 200.0
-        return variancia + 0.5 * (amplitude ** 2) + 0.45 * variancia_adm + penal_mirante
+
+        return (
+            2.0 * (var_carga + 0.5 * (amp_carga ** 2))
+            + 0.7 * (var_qtd + 0.3 * (amp_qtd ** 2))
+            + 0.2 * var_adm
+            + penal_mirante
+        )
 
     for _ in range(60):
         melhor_obj = objetivo_global()
@@ -864,6 +900,7 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw
 
     pacientes_livres.sort(key=lambda p: p["loc_key"])
     peso_extra_global = sum(ic["peso"] for ic in itens_ic) + sum(adm["peso"] for adm in itens_adm)
+    qtd_extra_global = len(itens_ic) + len(itens_adm)
     total_adm_global = sum(1 for p in pacientes if p.get("novo")) + len(itens_adm)
 
     grupos_livres = particionar_blocos_continuos_dp(
@@ -871,6 +908,7 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw
         fixos_por_medico,
         num_medicos,
         peso_extra_global=peso_extra_global,
+        qtd_extra_global=qtd_extra_global,
         total_adm_global=total_adm_global,
     )
 
