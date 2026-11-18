@@ -10,7 +10,7 @@ st.set_page_config(
     layout="centered",
 )
 
-# Parâmetros clínicos de carga e deslocamento (lógica original)
+# Parâmetros clínicos de carga e deslocamento
 PESO_PACIENTE_PADRAO = 1.0
 PESO_ADMISSAO_NOVA = 1.5
 PESO_INTERCONSULTA = 1.0
@@ -93,11 +93,6 @@ def chave_localizacao(leito: str):
         num = int(re.sub(r"\D", "", re.sub(r"^UTI\s*1A", "", leito_clean)) or 0)
         return (1, 1, 1, num, 0)
 
-    # ISOL 01, 02, 03 -> Leitos da UTI no 1600 (Torre 1, 6º andar)
-    if leito_clean.startswith("ISOL"):
-        num = int(re.sub(r"\D", "", leito_clean) or 0)
-        return (1, 1, 6, 50 + num, 0)
-
     # PREXA / Hemodinâmica / 2º Subsolo -> Torre 4, andar -2 (entre Torres 3 e 5)
     if (
         "PREXA" in leito_clean
@@ -107,12 +102,13 @@ def chave_localizacao(leito: str):
         num = int(re.sub(r"\D", "", re.sub(r"^2S", "", leito_clean)) or 0)
         return (1, 4, -2, num, 0)
 
-    # UIH -> Paulista, Torre 5, térreo
-    if leito_clean.startswith("UIH"):
+    # UIH / ISOL -> Paulista, Torre 5, térreo
+    if leito_clean.startswith("UIH") or leito_clean.startswith("ISOL"):
         nums = re.findall(r"\d+", leito_clean)
         unidade = int(nums[0]) if len(nums) >= 1 else 1
         leito_num = int(nums[1]) if len(nums) >= 2 else 0
-        return (1, 5, 0, 100 * unidade + leito_num, 0)
+        prefixo_ord = 100 if leito_clean.startswith("UIH") else 200
+        return (1, 5, 0, prefixo_ord * unidade + leito_num, 0)
 
     # Leitos padrão 1000..7999
     m = re.match(r"^(\d)(\d)(\d{2})(?:[-\s]+(\d+))?$", leito_clean)
@@ -169,9 +165,6 @@ def interpretar_texto_livre_pacientes(linhas, prefixo_strip_regex=None):
             elif leito_detectado.startswith("UTI 1A") or leito_detectado.startswith("UTI1A"):
                 torre_linha = 1
                 descricao_loc = f"{leito_detectado} (Torre 1, 1º andar - UTI 1A)"
-            elif leito_detectado.startswith("ISOL"):
-                torre_linha = 1
-                descricao_loc = f"{leito_detectado} (UTI 1600 - Torre 1, 6º andar)"
             elif loc_key[0] in (1, 2):
                 torre_linha = loc_key[1]
                 predio_lbl = "Mirante" if loc_key[0] == 2 else f"Torre {loc_key[1]}"
@@ -247,15 +240,12 @@ def calcular_carga_total_medico(grupo_pacientes):
     return peso_pacs + custo_desloc
 
 
-def contar_admissoes_grupo(grupo_pacientes):
-    return sum(1 for p in grupo_pacientes if p.get("novo") or p.get("origem") == "ADM")
-
-
 def leito_compacto_prefixo(leito_norm: str, prefixos: tuple) -> bool:
     return any(leito_norm.startswith(p) for p in prefixos)
 
 
 def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
+    """Verifica se o termo se refere a um setor/torre/andar inteiro (ex: mirante, prexa, torre 4, 1700, utie)."""
     lk = item["loc_key"]
     leito_norm = normalizar_texto(item.get("leito", "")).replace(" ", "")
     termo_compacto = termo_norm.replace(" ", "").replace("-", "")
@@ -272,11 +262,8 @@ def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
     if termo_compacto in ("uti1a",):
         return leito_norm.startswith("uti1a")
 
-    if termo_compacto in ("isol", "uti1600"):
-        return leito_norm.startswith("isol")
-
-    if termo_compacto in ("uih",):
-        return leito_norm.startswith("uih")
+    if termo_compacto in ("uih", "isol"):
+        return leito_norm.startswith(termo_compacto)
 
     m_torre = re.fullmatch(r"(?:torre|t)\s*([1-7])", termo_norm)
     if m_torre:
@@ -295,6 +282,12 @@ def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
 
 
 def _analisar_componente_peculiaridade(termo: str):
+    """
+    Extrai separadamente da expressão:
+      - na: Número de Atendimento (6+ dígitos, ex: 12345678)
+      - leito: Leito informado (ex: '1700 01', 'UTIE 05'), que pode estar desatualizado na planilha
+      - nome: Nome do paciente (ex: 'Fulano de Tal')
+    """
     termo_clean = re.sub(r"\s+", " ", termo.replace("\t", " ")).strip(" .:-–—>")
     if not termo_clean:
         return None, None, ""
@@ -338,6 +331,16 @@ def _casar_leito_item(leito_busca: str, item: dict) -> bool:
 
 
 def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
+    """
+    Suporta comandos persistentes entre linhas (Enter):
+      - Excluir / Exclua (mantém exclusão nas linhas seguintes até outro comando)
+      - M1 / M2 ... (mantém fixação no médico indicado nas linhas seguintes)
+      - Mesma equipe / Mesmo médico / Juntos (mantém os pacientes listados juntos no mesmo médico)
+    Prioridade de busca por paciente:
+      1) Número de Atendimento (NA), se fornecido (único por paciente)
+      2) Nome do paciente (ignora divergência de leito caso a planilha esteja desatualizada, usando leito apenas para desempatar homônimos)
+      3) Setor/torre/andar ou leito isolado (quando nenhum nome ou NA foi fornecido na linha)
+    """
     avisos = []
     grupos_juntos = []
 
@@ -374,6 +377,7 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
             avisos.append(f"Não identifiquei qual médico ou ação na regra: '{linha}'")
             continue
 
+        # Preserva 'de/da/do/das/dos' para não quebrar nomes compostos
         resto = re.sub(r"\b(?:m|med|medico|médico)\s*\d+\b", " ", linha, flags=re.IGNORECASE)
         resto = re.sub(
             r"\b(?:excluir|exclui|exclua|tirar|tira|tire|remover|remove|remova|alta|óbito|obito|ignorar|ignore|retirar|retire|deixar|colocar|ficar|manter|juntos|juntar|agrupar|mesmo|mesma|equipe|com|para|no|na|nos|nas|o|a|os|as|paciente|pacientes|leito|leitos|localizacao|localização|setor|pq|porque|ele|ela|quer|ver|esse|essa|esses|essas|em|lista|ic|interconsulta|admissao|admissão|na)\b",
@@ -395,12 +399,14 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
             candidatos_ativos = [it for it in todos_itens if not it.get("excluido")]
             selecionados = []
 
+            # 1) Busca por NA (identificador único do paciente)
             if na_busca:
                 selecionados = [
                     it for it in candidatos_ativos
                     if na_busca in it.get("atendimento", "") or na_busca in it.get("nome", "")
                 ]
 
+            # 2) Se não achou por NA (ou não veio NA), busca pelo Nome (mesmo se o leito da planilha estiver desatualizado)
             if not selecionados and nome_busca:
                 nome_busca_norm = normalizar_texto(nome_busca)
                 setor_matches = [it for it in candidatos_ativos if _casar_setor_ou_localizacao(nome_busca_norm, it)]
@@ -414,6 +420,7 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
                     else:
                         selecionados = nome_matches
 
+            # 3) Fallback pelo leito apenas se nenhum nome nem NA foi informado na linha
             if not selecionados and not na_busca and not nome_busca and leito_busca:
                 leito_busca_norm = normalizar_texto(leito_busca)
                 setor_matches = [it for it in candidatos_ativos if _casar_setor_ou_localizacao(leito_busca_norm, it)]
@@ -1020,7 +1027,7 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw
     for i in range(num_medicos):
         c_total = calcular_carga_total_medico(grupos_finais[i])
         c_desloc = calcular_custo_deslocamento_grupo([p["loc_key"] for p in grupos_finais[i]])
-        qtd_adm = contar_admissoes_grupo(grupos_finais[i])
+        qtd_adm = sum(1 for p in grupos_finais[i] if p.get("novo") or p.get("origem") == "ADM")
         tabela_cargas.append({
             "Médico": f"M{i+1}",
             "Pacientes": contagem_total[i],
