@@ -93,6 +93,11 @@ def chave_localizacao(leito: str):
         num = int(re.sub(r"\D", "", re.sub(r"^UTI\s*1A", "", leito_clean)) or 0)
         return (1, 1, 1, num, 0)
 
+    # ISOL 01, 02, 03 -> Leitos da UTI no 1600 (Torre 1, 6º andar)
+    if leito_clean.startswith("ISOL"):
+        num = int(re.sub(r"\D", "", leito_clean) or 0)
+        return (1, 1, 6, 50 + num, 0)
+
     # PREXA / Hemodinâmica / 2º Subsolo -> Torre 4, andar -2 (entre Torres 3 e 5)
     if (
         "PREXA" in leito_clean
@@ -102,13 +107,12 @@ def chave_localizacao(leito: str):
         num = int(re.sub(r"\D", "", re.sub(r"^2S", "", leito_clean)) or 0)
         return (1, 4, -2, num, 0)
 
-    # UIH / ISOL -> Paulista, Torre 5, térreo
-    if leito_clean.startswith("UIH") or leito_clean.startswith("ISOL"):
+    # UIH -> Paulista, Torre 5, térreo
+    if leito_clean.startswith("UIH"):
         nums = re.findall(r"\d+", leito_clean)
         unidade = int(nums[0]) if len(nums) >= 1 else 1
         leito_num = int(nums[1]) if len(nums) >= 2 else 0
-        prefixo_ord = 100 if leito_clean.startswith("UIH") else 200
-        return (1, 5, 0, prefixo_ord * unidade + leito_num, 0)
+        return (1, 5, 0, 100 * unidade + leito_num, 0)
 
     # Leitos padrão 1000..7999
     m = re.match(r"^(\d)(\d)(\d{2})(?:[-\s]+(\d+))?$", leito_clean)
@@ -165,6 +169,9 @@ def interpretar_texto_livre_pacientes(linhas, prefixo_strip_regex=None):
             elif leito_detectado.startswith("UTI 1A") or leito_detectado.startswith("UTI1A"):
                 torre_linha = 1
                 descricao_loc = f"{leito_detectado} (Torre 1, 1º andar - UTI 1A)"
+            elif leito_detectado.startswith("ISOL"):
+                torre_linha = 1
+                descricao_loc = f"{leito_detectado} (UTI 1600 - Torre 1, 6º andar)"
             elif loc_key[0] in (1, 2):
                 torre_linha = loc_key[1]
                 predio_lbl = "Mirante" if loc_key[0] == 2 else f"Torre {loc_key[1]}"
@@ -245,7 +252,7 @@ def leito_compacto_prefixo(leito_norm: str, prefixos: tuple) -> bool:
 
 
 def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
-    """Verifica se o termo se refere a um setor/torre/andar inteiro (ex: mirante, prexa, torre 4, 1700, utie)."""
+    """Verifica se o termo se refere a um setor/torre/andar inteiro (ex: mirante, prexa, torre 4, 1700, utie, isol)."""
     lk = item["loc_key"]
     leito_norm = normalizar_texto(item.get("leito", "")).replace(" ", "")
     termo_compacto = termo_norm.replace(" ", "").replace("-", "")
@@ -262,8 +269,11 @@ def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
     if termo_compacto in ("uti1a",):
         return leito_norm.startswith("uti1a")
 
-    if termo_compacto in ("uih", "isol"):
-        return leito_norm.startswith(termo_compacto)
+    if termo_compacto in ("isol", "uti1600"):
+        return leito_norm.startswith("isol")
+
+    if termo_compacto in ("uih",):
+        return leito_norm.startswith("uih")
 
     m_torre = re.fullmatch(r"(?:torre|t)\s*([1-7])", termo_norm)
     if m_torre:
@@ -284,9 +294,9 @@ def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
 def _analisar_componente_peculiaridade(termo: str):
     """
     Extrai separadamente da expressão:
-      - na: Número de Atendimento (6+ dígitos, ex: 12345678)
-      - leito: Leito informado (ex: '1700 01', 'UTIE 05'), que pode estar desatualizado na planilha
-      - nome: Nome do paciente (ex: 'Fulano de Tal')
+- na: Número de Atendimento (6+ dígitos, ex: 12345678)
+- leito: Leito informado (ex: '1700 01', 'UTIE 05'), que pode estar desatualizado na planilha
+- nome: Nome do paciente (ex: 'Fulano de Tal')
     """
     termo_clean = re.sub(r"\s+", " ", termo.replace("\t", " ")).strip(" .:-–—>")
     if not termo_clean:
@@ -333,9 +343,9 @@ def _casar_leito_item(leito_busca: str, item: dict) -> bool:
 def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
     """
     Suporta comandos persistentes entre linhas (Enter):
-      - Excluir / Exclua (mantém exclusão nas linhas seguintes até outro comando)
-      - M1 / M2 ... (mantém fixação no médico indicado nas linhas seguintes)
-      - Mesma equipe / Mesmo médico / Juntos (mantém os pacientes listados juntos no mesmo médico)
+- Excluir / Exclua (mantém exclusão nas linhas seguintes até outro comando)
+- M1 / M2 ... (mantém fixação no médico indicado nas linhas seguintes)
+- Mesma equipe / Mesmo médico / Juntos (mantém os pacientes listados juntos no mesmo médico)
     Prioridade de busca por paciente:
       1) Número de Atendimento (NA), se fornecido (único por paciente)
       2) Nome do paciente (ignora divergência de leito caso a planilha esteja desatualizada, usando leito apenas para desempatar homônimos)
