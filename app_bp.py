@@ -476,7 +476,6 @@ def particionar_blocos_continuos_dp(
 
     custo_desloc_estimado = (k - 1) * 0.35 + (CUSTO_DESLOC_MIRANTE if any(x["loc_key"][0] == 2 for x in itens_livres) else 0.0)
 
-    # Metas na hierarquia: 1) Carga Total, 2) Número de Pacientes, 3) Admissões
     carga_ideal = (prefixo_peso[n] + peso_fixo_total + peso_extra_global + custo_desloc_estimado) / k
     qtd_pacs_ideal = (n + qtd_fixa_total + qtd_extra_global) / k
     adm_ideal = total_adm_global / k if k > 0 else 0.0
@@ -518,11 +517,11 @@ def particionar_blocos_continuos_dp(
                     if loc_ant[0] == 2 and loc_ini[0] == 2:
                         penalidade_corte_andar += 200.0
 
-                # Hierarquia estrita de equilíbrio:
-                # 1º Carga Total (peso 2.5) > 2º Número de Pacientes (peso 0.9) > 3º Admissões (peso 0.25)
-                custo_carga = ((carga_total_med - carga_ideal) ** 2) * 2.5
-                custo_qtd = ((qtd_pacs_med - qtd_pacs_ideal) ** 2) * 0.9
-                custo_adm = ((qtd_adm_med - adm_ideal) ** 2) * 0.25
+                # Hierarquia real:
+                # 1º Carga Total (peso 4.0) > 2º Número de Pacientes (peso 0.15) > 3º Admissões (peso 0.08)
+                custo_carga = ((carga_total_med - carga_ideal) ** 2) * 4.0
+                custo_qtd = ((qtd_pacs_med - qtd_pacs_ideal) ** 2) * 0.15
+                custo_adm = ((qtd_adm_med - adm_ideal) ** 2) * 0.08
 
                 custo = dp[j - 1][p] + custo_carga + custo_qtd + custo_adm + penalidade_corte_andar
                 if custo < dp[j][i]:
@@ -547,10 +546,18 @@ def escolher_medico_item_extra(item, grupos_finais):
     torre_ic = item.get("torre")
     eh_adm = bool(item.get("novo") or item.get("origem") == "ADM")
 
+    cargas_atuais = [calcular_carga_total_medico(g) for g in grupos_finais]
+    menor_carga = min(cargas_atuais) if cargas_atuais else 0.0
+
+    # Só considera afinidade de torre/andar entre médicos que não estejam sobrecarregados
+    # (diferença máxima de 0.75 ponto acima do médico mais leve)
+    elegiveis_proximidade = {
+        i for i, c in enumerate(cargas_atuais) if c <= menor_carga + 0.75
+    }
+
     def score_escolha(i):
-        # Hierarquia: 1º Carga Total, 2º Número de Pacientes, 3º Admissões (se o item for admissão)
         return (
-            round(calcular_carga_total_medico(grupos_finais[i]), 2),
+            round(cargas_atuais[i], 2),
             len(grupos_finais[i]),
             contar_admissoes_grupo(grupos_finais[i]) if eh_adm else 0,
         )
@@ -563,6 +570,7 @@ def escolher_medico_item_extra(item, grupos_finais):
 
     eh_mirante = (loc_ic[0] == 2) or (torre_ic in (6, 7))
     if eh_mirante:
+        # Mirante é regra absoluta: mantém tudo no mesmo médico
         ja_no_mirante = [i for i, g in enumerate(grupos_finais) if ja_tem_qualquer_no_mirante(g)]
         if ja_no_mirante:
             return min(ja_no_mirante, key=score_escolha)
@@ -573,38 +581,38 @@ def escolher_medico_item_extra(item, grupos_finais):
 
         if eixo_torre == 4:
             no_eixo_3_5 = [
-                i for i, g in enumerate(grupos_finais)
-                if tem_na_lista_original(g, lambda lk: lk[0] == 1 and lk[1] in (3, 4, 5))
+                i for i in elegiveis_proximidade
+                if tem_na_lista_original(grupos_finais[i], lambda lk: lk[0] == 1 and lk[1] in (3, 4, 5))
             ]
             if no_eixo_3_5:
                 return min(no_eixo_3_5, key=score_escolha)
 
         if quarto_ic != 50 and andar_ic >= 0:
             mesmo_quarto = [
-                i for i, g in enumerate(grupos_finais)
-                if tem_na_lista_original(g, lambda lk: lk[:4] == (predio_ic, eixo_torre, andar_ic, quarto_ic))
+                i for i in elegiveis_proximidade
+                if tem_na_lista_original(grupos_finais[i], lambda lk: lk[:4] == (predio_ic, eixo_torre, andar_ic, quarto_ic))
             ]
             if mesmo_quarto:
                 return min(mesmo_quarto, key=score_escolha)
 
             mesmo_andar = [
-                i for i, g in enumerate(grupos_finais)
-                if tem_na_lista_original(g, lambda lk: lk[:3] == (predio_ic, eixo_torre, andar_ic))
+                i for i in elegiveis_proximidade
+                if tem_na_lista_original(grupos_finais[i], lambda lk: lk[:3] == (predio_ic, eixo_torre, andar_ic))
             ]
             if mesmo_andar:
                 return min(mesmo_andar, key=score_escolha)
 
         mesma_torre = [
-            i for i, g in enumerate(grupos_finais)
-            if tem_na_lista_original(g, lambda lk: lk[:2] == (predio_ic, eixo_torre))
+            i for i in elegiveis_proximidade
+            if tem_na_lista_original(grupos_finais[i], lambda lk: lk[:2] == (predio_ic, eixo_torre))
         ]
         if mesma_torre:
             return min(mesma_torre, key=score_escolha)
 
     elif torre_ic:
         mesma_torre = [
-            i for i, g in enumerate(grupos_finais)
-            if tem_na_lista_original(g, lambda lk: lk[:2] == (1, int(torre_ic)))
+            i for i in elegiveis_proximidade
+            if tem_na_lista_original(grupos_finais[i], lambda lk: lk[:2] == (1, int(torre_ic)))
         ]
         if mesma_torre:
             return min(mesma_torre, key=score_escolha)
@@ -652,19 +660,18 @@ def rebalancear_fronteiras_finais(grupos_finais):
         return
 
     def objetivo_global():
-        # 1º Prioridade: Carga Total (variância + amplitude)
+        # 1º Prioridade (absoluta): Carga Total (variância + amplitude)
         cargas = [calcular_carga_total_medico(g) for g in grupos_finais]
         media_c = sum(cargas) / k
         var_carga = sum((c - media_c) ** 2 for c in cargas)
         amp_carga = max(cargas) - min(cargas)
 
-        # 2º Prioridade: Número de Pacientes por médico
+        # 2º Prioridade (desempate): Número de Pacientes por médico
         qtds = [len(g) for g in grupos_finais]
         media_q = sum(qtds) / k
         var_qtd = sum((q - media_q) ** 2 for q in qtds)
-        amp_qtd = max(qtds) - min(qtds)
 
-        # 3º Prioridade: Distribuição de Admissões
+        # 3º Prioridade (desempate fino): Distribuição de Admissões
         adms = [contar_admissoes_grupo(g) for g in grupos_finais]
         media_a = sum(adms) / k
         var_adm = sum((a - media_a) ** 2 for a in adms)
@@ -674,9 +681,9 @@ def rebalancear_fronteiras_finais(grupos_finais):
         penal_mirante = max(0, medicos_mirante - 1) * 200.0
 
         return (
-            2.0 * (var_carga + 0.5 * (amp_carga ** 2))
-            + 0.7 * (var_qtd + 0.3 * (amp_qtd ** 2))
-            + 0.2 * var_adm
+            4.0 * (var_carga + 0.6 * (amp_carga ** 2))
+            + 0.12 * var_qtd
+            + 0.08 * var_adm
             + penal_mirante
         )
 
