@@ -19,6 +19,8 @@ CUSTO_DESLOC_MIRANTE = 1.0       # +1.0 pelo deslocamento entre prédios (Paulis
 CUSTO_DESLOC_TROCA_TORRE = 0.5   # +0.5 por torre adicional visitada no Paulista
 CUSTO_DESLOC_TROCA_ANDAR = 0.15  # +0.15 por andar adicional na mesma torre
 
+MAX_DIF_PACIENTES = 2            # Limite máximo de diferença de pacientes entre médicos
+
 CORES_MEDICOS = [
     (0.78, 0.89, 0.99),  # M1: Azul
     (0.99, 0.89, 0.72),  # M2: Laranja
@@ -294,9 +296,9 @@ def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
 def _analisar_componente_peculiaridade(termo: str):
     """
     Extrai separadamente da expressão:
-- na: Número de Atendimento (6+ dígitos, ex: 12345678)
-- leito: Leito informado (ex: '1700 01', 'UTIE 05'), que pode estar desatualizado na planilha
-- nome: Nome do paciente (ex: 'Fulano de Tal')
+      - na: Número de Atendimento (6+ dígitos, ex: 12345678)
+      - leito: Leito informado (ex: '1700 01', 'UTIE 05'), que pode estar desatualizado na planilha
+      - nome: Nome do paciente (ex: 'Fulano de Tal')
     """
     termo_clean = re.sub(r"\s+", " ", termo.replace("\t", " ")).strip(" .:-–—>")
     if not termo_clean:
@@ -343,13 +345,9 @@ def _casar_leito_item(leito_busca: str, item: dict) -> bool:
 def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
     """
     Suporta comandos persistentes entre linhas (Enter):
-- Excluir / Exclua (mantém exclusão nas linhas seguintes até outro comando)
-- M1 / M2 ... (mantém fixação no médico indicado nas linhas seguintes)
-- Mesma equipe / Mesmo médico / Juntos (mantém os pacientes listados juntos no mesmo médico)
-    Prioridade de busca por paciente:
-      1) Número de Atendimento (NA), se fornecido (único por paciente)
-      2) Nome do paciente (ignora divergência de leito caso a planilha esteja desatualizada, usando leito apenas para desempatar homônimos)
-      3) Setor/torre/andar ou leito isolado (quando nenhum nome ou NA foi fornecido na linha)
+      - Excluir / Exclua (mantém exclusão nas linhas seguintes até outro comando)
+      - M1 / M2 ... (mantém fixação no médico indicado nas linhas seguintes)
+      - Mesma equipe / Mesmo médico / Juntos (mantém os pacientes listados juntos no mesmo médico)
     """
     avisos = []
     grupos_juntos = []
@@ -387,7 +385,6 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
             avisos.append(f"Não identifiquei qual médico ou ação na regra: '{linha}'")
             continue
 
-        # Preserva 'de/da/do/das/dos' para não quebrar nomes compostos
         resto = re.sub(r"\b(?:m|med|medico|médico)\s*\d+\b", " ", linha, flags=re.IGNORECASE)
         resto = re.sub(
             r"\b(?:excluir|exclui|exclua|tirar|tira|tire|remover|remove|remova|alta|óbito|obito|ignorar|ignore|retirar|retire|deixar|colocar|ficar|manter|juntos|juntar|agrupar|mesmo|mesma|equipe|com|para|no|na|nos|nas|o|a|os|as|paciente|pacientes|leito|leitos|localizacao|localização|setor|pq|porque|ele|ela|quer|ver|esse|essa|esses|essas|em|lista|ic|interconsulta|admissao|admissão|na)\b",
@@ -409,14 +406,12 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
             candidatos_ativos = [it for it in todos_itens if not it.get("excluido")]
             selecionados = []
 
-            # 1) Busca por NA (identificador único do paciente)
             if na_busca:
                 selecionados = [
                     it for it in candidatos_ativos
                     if na_busca in it.get("atendimento", "") or na_busca in it.get("nome", "")
                 ]
 
-            # 2) Se não achou por NA (ou não veio NA), busca pelo Nome (mesmo se o leito da planilha estiver desatualizado)
             if not selecionados and nome_busca:
                 nome_busca_norm = normalizar_texto(nome_busca)
                 setor_matches = [it for it in candidatos_ativos if _casar_setor_ou_localizacao(nome_busca_norm, it)]
@@ -430,7 +425,6 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
                     else:
                         selecionados = nome_matches
 
-            # 3) Fallback pelo leito apenas se nenhum nome nem NA foi informado na linha
             if not selecionados and not na_busca and not nome_busca and leito_busca:
                 leito_busca_norm = normalizar_texto(leito_busca)
                 setor_matches = [it for it in candidatos_ativos if _casar_setor_ou_localizacao(leito_busca_norm, it)]
@@ -469,7 +463,7 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
     return avisos, grupos_juntos
 
 
-def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extra_global=0.0):
+def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extra_global=0.0, qtd_extra_global=0):
     n = len(itens_livres)
     if n == 0:
         return [[] for _ in range(k)]
@@ -480,8 +474,11 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
         prefixo_peso[i + 1] = prefixo_peso[i] + pesos[i]
 
     peso_fixo_total = sum(sum(p["peso"] for p in g) for g in fixos_por_medico)
+    qtd_fixa_total = sum(len(g) for g in fixos_por_medico)
     custo_desloc_estimado = (k - 1) * 0.35 + (CUSTO_DESLOC_MIRANTE if any(x["loc_key"][0] == 2 for x in itens_livres) else 0.0)
+
     carga_ideal = (prefixo_peso[n] + peso_fixo_total + peso_extra_global + custo_desloc_estimado) / k
+    qtd_media = (n + qtd_fixa_total + qtd_extra_global) / k
 
     dp = [[float("inf")] * (n + 1) for _ in range(k + 1)]
     corte = [[0] * (n + 1) for _ in range(k + 1)]
@@ -490,6 +487,7 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
     for j in range(1, k + 1):
         fixos_med = fixos_por_medico[j - 1]
         peso_fixo_med = sum(p["peso"] for p in fixos_med)
+        qtd_fixa_med = len(fixos_med)
         locs_fixas_med = [p["loc_key"] for p in fixos_med]
 
         for i in range(0, n + 1):
@@ -502,6 +500,7 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
 
                 bloco = itens_livres[p:i]
                 soma_pacientes = prefixo_peso[i] - prefixo_peso[p]
+                qtd_pacs_med = qtd_fixa_med + (i - p)
                 locs_bloco = locs_fixas_med + [x["loc_key"] for x in bloco]
                 custo_desloc = calcular_custo_deslocamento_grupo(locs_bloco)
 
@@ -516,7 +515,16 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
                     if loc_ant[0] == 2 and loc_ini[0] == 2:
                         penalidade_corte_andar += 200.0
 
-                custo = dp[j - 1][p] + ((carga_total_med - carga_ideal) ** 2) * 2.0 + penalidade_corte_andar
+                # Penaliza se a contagem de pacientes fugir mais de 1.15 da média (evita diferença > 2)
+                desvio_qtd = abs(qtd_pacs_med - qtd_media)
+                penalidade_limite_qtd = ((desvio_qtd - 1.15) ** 2) * 150.0 if desvio_qtd > 1.15 else 0.0
+
+                custo = (
+                    dp[j - 1][p]
+                    + ((carga_total_med - carga_ideal) ** 2) * 2.0
+                    + penalidade_corte_andar
+                    + penalidade_limite_qtd
+                )
                 if custo < dp[j][i]:
                     dp[j][i] = custo
                     corte[j][i] = p
@@ -537,6 +545,11 @@ def escolher_medico_item_extra(item, grupos_finais):
 
     loc_ic = item["loc_key"]
     torre_ic = item.get("torre")
+    menor_qtd = min(len(g) for g in grupos_finais) if grupos_finais else 0
+
+    def respeita_teto_qtd(i):
+        # Só permite receber o item se a nova contagem não ultrapassar menor_qtd + MAX_DIF_PACIENTES
+        return (len(grupos_finais[i]) + 1 - menor_qtd) <= MAX_DIF_PACIENTES
 
     def tem_na_lista_original(grupo, pred):
         return any(p.get("origem") == "PDF" and pred(p["loc_key"]) for p in grupo)
@@ -551,48 +564,52 @@ def escolher_medico_item_extra(item, grupos_finais):
             return min(ja_no_mirante, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
         return min(range(len(grupos_finais)), key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
 
+    elegiveis = [i for i in range(len(grupos_finais)) if respeita_teto_qtd(i)]
+    if not elegiveis:
+        elegiveis = list(range(len(grupos_finais)))
+
     if loc_ic[0] == 1:
         predio_ic, eixo_torre, andar_ic, quarto_ic, _ = loc_ic
 
         if eixo_torre == 4:
             no_eixo_3_5 = [
-                i for i, g in enumerate(grupos_finais)
-                if tem_na_lista_original(g, lambda lk: lk[0] == 1 and lk[1] in (3, 4, 5))
+                i for i in elegiveis
+                if tem_na_lista_original(grupos_finais[i], lambda lk: lk[0] == 1 and lk[1] in (3, 4, 5))
             ]
             if no_eixo_3_5:
                 return min(no_eixo_3_5, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
 
         if quarto_ic != 50 and andar_ic >= 0:
             mesmo_quarto = [
-                i for i, g in enumerate(grupos_finais)
-                if tem_na_lista_original(g, lambda lk: lk[:4] == (predio_ic, eixo_torre, andar_ic, quarto_ic))
+                i for i in elegiveis
+                if tem_na_lista_original(grupos_finais[i], lambda lk: lk[:4] == (predio_ic, eixo_torre, andar_ic, quarto_ic))
             ]
             if mesmo_quarto:
                 return min(mesmo_quarto, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
 
             mesmo_andar = [
-                i for i, g in enumerate(grupos_finais)
-                if tem_na_lista_original(g, lambda lk: lk[:3] == (predio_ic, eixo_torre, andar_ic))
+                i for i in elegiveis
+                if tem_na_lista_original(grupos_finais[i], lambda lk: lk[:3] == (predio_ic, eixo_torre, andar_ic))
             ]
             if mesmo_andar:
                 return min(mesmo_andar, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
 
         mesma_torre = [
-            i for i, g in enumerate(grupos_finais)
-            if tem_na_lista_original(g, lambda lk: lk[:2] == (predio_ic, eixo_torre))
+            i for i in elegiveis
+            if tem_na_lista_original(grupos_finais[i], lambda lk: lk[:2] == (predio_ic, eixo_torre))
         ]
         if mesma_torre:
             return min(mesma_torre, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
 
     elif torre_ic:
         mesma_torre = [
-            i for i, g in enumerate(grupos_finais)
-            if tem_na_lista_original(g, lambda lk: lk[:2] == (1, int(torre_ic)))
+            i for i in elegiveis
+            if tem_na_lista_original(grupos_finais[i], lambda lk: lk[:2] == (1, int(torre_ic)))
         ]
         if mesma_torre:
             return min(mesma_torre, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
 
-    return min(range(len(grupos_finais)), key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
+    return min(elegiveis, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
 
 
 def resolver_grupos_juntos(grupos_juntos, grupos_finais):
@@ -636,11 +653,17 @@ def rebalancear_fronteiras_finais(grupos_finais):
         media = sum(cargas) / k
         variancia = sum((c - media) ** 2 for c in cargas)
         amplitude = max(cargas) - min(cargas)
+
+        qtds = [len(g) for g in grupos_finais]
+        excesso_dif_qtd = max(0, (max(qtds) - min(qtds)) - MAX_DIF_PACIENTES)
+        penal_limite_qtd = (excesso_dif_qtd ** 2) * 500.0
+
         medicos_mirante = sum(1 for g in grupos_finais if any(p["loc_key"][0] == 2 for p in g))
         penal_mirante = max(0, medicos_mirante - 1) * 200.0
-        return variancia + 0.5 * (amplitude ** 2) + penal_mirante
 
-    for _ in range(60):
+        return variancia + 0.5 * (amplitude ** 2) + penal_limite_qtd + penal_mirante
+
+    for _ in range(80):
         melhor_obj = objetivo_global()
         melhor_cadeia = None
 
@@ -860,12 +883,14 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw
 
     pacientes_livres.sort(key=lambda p: p["loc_key"])
     peso_extra_global = sum(ic["peso"] for ic in itens_ic) + sum(adm["peso"] for adm in itens_adm)
+    qtd_extra_global = len(itens_ic) + len(itens_adm)
 
     grupos_livres = particionar_blocos_continuos_dp(
         pacientes_livres,
         fixos_por_medico,
         num_medicos,
         peso_extra_global=peso_extra_global,
+        qtd_extra_global=qtd_extra_global,
     )
 
     grupos_finais = [[] for _ in range(num_medicos)]
