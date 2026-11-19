@@ -259,7 +259,6 @@ def leito_compacto_prefixo(leito_norm: str, prefixos: tuple) -> bool:
 
 
 def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
-    """Verifica se o termo se refere a um setor/torre/andar inteiro (ex: mirante, prexa, torre 4, 1700, utie, isol)."""
     lk = item["loc_key"]
     leito_norm = normalizar_texto(item.get("leito", "")).replace(" ", "")
     termo_compacto = termo_norm.replace(" ", "").replace("-", "")
@@ -299,12 +298,6 @@ def _casar_setor_ou_localizacao(termo_norm: str, item: dict) -> bool:
 
 
 def _analisar_componente_peculiaridade(termo: str):
-    """
-    Extrai separadamente da expressão:
-      - na: Número de Atendimento (6+ dígitos, ex: 12345678)
-      - leito: Leito informado (ex: '1700 01', 'UTIE 05'), que pode estar desatualizado na planilha
-      - nome: Nome do paciente (ex: 'Fulano de Tal')
-    """
     termo_clean = re.sub(r"\s+", " ", termo.replace("\t", " ")).strip(" .:-–—>")
     if not termo_clean:
         return None, None, ""
@@ -348,12 +341,6 @@ def _casar_leito_item(leito_busca: str, item: dict) -> bool:
 
 
 def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
-    """
-    Suporta comandos persistentes entre linhas (Enter):
-      - Excluir / Exclua (mantém exclusão nas linhas seguintes até outro comando)
-      - M1 / M2 ... (mantém fixação no médico indicado nas linhas seguintes)
-      - Mesma equipe / Mesmo médico / Juntos (mantém os pacientes listados juntos no mesmo médico)
-    """
     avisos = []
     grupos_juntos = []
 
@@ -495,7 +482,10 @@ def particionar_blocos_continuos_dp(
 
     carga_ideal = (prefixo_peso[n] + peso_fixo_total + peso_extra_global + custo_desloc_estimado) / k
     qtd_media = (n + qtd_fixa_total + qtd_extra_global) / k
-    adm_media = (prefixo_adm[n] + adm_fixa_total + adm_extra_global) / k
+    total_adms = prefixo_adm[n] + adm_fixa_total + adm_extra_global
+    adm_media = total_adms / k
+    # Teto máximo absoluto de admissões permitido por médico para garantir dif <= MAX_DIF_ADMISSOES
+    teto_adm_med = int(adm_media) + MAX_DIF_ADMISSOES
 
     dp = [[float("inf")] * (n + 1) for _ in range(k + 1)]
     corte = [[0] * (n + 1) for _ in range(k + 1)]
@@ -536,11 +526,11 @@ def particionar_blocos_continuos_dp(
 
                 # Penaliza se a contagem de pacientes fugir mais de 1.15 da média (evita diferença > 2)
                 desvio_qtd = abs(qtd_pacs_med - qtd_media)
-                penalidade_limite_qtd = ((desvio_qtd - 1.15) ** 2) * 150.0 if desvio_qtd > 1.15 else 0.0
+                penalidade_limite_qtd = ((desvio_qtd - 1.15) ** 2) * 200.0 if desvio_qtd > 1.15 else 0.0
 
-                # Penaliza se a contagem de admissões fugir mais de 1.15 da média (evita diferença > 2)
-                desvio_adm = abs(qtd_adm_med - adm_media)
-                penalidade_limite_adm = ((desvio_adm - 1.15) ** 2) * 150.0 if desvio_adm > 1.15 else 0.0
+                # Penalidade fortíssima se ultrapassar o teto de admissões por médico
+                excesso_adm = max(0, qtd_adm_med - teto_adm_med)
+                penalidade_limite_adm = (excesso_adm ** 2) * 2500.0
 
                 custo = (
                     dp[j - 1][p]
@@ -594,7 +584,6 @@ def escolher_medico_item_extra(item, grupos_finais):
 
     elegiveis = [i for i in range(len(grupos_finais)) if respeita_tetos(i)]
     if not elegiveis:
-        # Relaxa teto de pacientes antes do teto de admissões se necessário
         elegiveis = [
             i for i in range(len(grupos_finais))
             if (not eh_adm) or ((contar_admissoes_grupo(grupos_finais[i]) + 1 - menor_adm) <= MAX_DIF_ADMISSOES)
@@ -688,103 +677,111 @@ def rebalancear_fronteiras_finais(grupos_finais):
 
         qtds = [len(g) for g in grupos_finais]
         excesso_dif_qtd = max(0, (max(qtds) - min(qtds)) - MAX_DIF_PACIENTES)
-        penal_limite_qtd = (excesso_dif_qtd ** 2) * 500.0
+        penal_limite_qtd = (excesso_dif_qtd ** 2) * 800.0
 
         adms = [contar_admissoes_grupo(g) for g in grupos_finais]
         excesso_dif_adm = max(0, (max(adms) - min(adms)) - MAX_DIF_ADMISSOES)
-        penal_limite_adm = (excesso_dif_adm ** 2) * 500.0
+        penal_limite_adm = (excesso_dif_adm ** 2) * 2500.0
 
         medicos_mirante = sum(1 for g in grupos_finais if any(p["loc_key"][0] == 2 for p in g))
         penal_mirante = max(0, medicos_mirante - 1) * 200.0
 
         return variancia + 0.5 * (amplitude ** 2) + penal_limite_qtd + penal_limite_adm + penal_mirante
 
-    for _ in range(80):
+    for _ in range(100):
         melhor_obj = objetivo_global()
         melhor_cadeia = None
 
-        for b in range(1, k):
-            for a in range(0, b):
-                movidos = []
-                valido = True
-                for step in range(b, a, -1):
-                    moveis = [
-                        p for p in grupos_finais[step]
-                        if p.get("origem") == "PDF" and p.get("medico_fixo") is None
-                    ]
-                    if len(moveis) <= 1:
-                        valido = False
-                        break
-                    cand = moveis[0]
-                    grupos_finais[step].remove(cand)
-                    grupos_finais[step - 1].append(cand)
-                    cand["medico"] = step
-                    movidos.append((step, cand))
+        # Permite mover 1, 2 ou 3 pacientes da fronteira por vez para destravar blocos de admissões
+        for passo in (1, 2, 3):
+            for b in range(1, k):
+                for a in range(0, b):
+                    movidos = []
+                    valido = True
+                    for step in range(b, a, -1):
+                        moveis = [
+                            p for p in grupos_finais[step]
+                            if p.get("origem") == "PDF" and p.get("medico_fixo") is None
+                        ]
+                        if len(moveis) <= passo:
+                            valido = False
+                            break
+                        cands = moveis[:passo]
+                        for c in cands:
+                            grupos_finais[step].remove(c)
+                            grupos_finais[step - 1].append(c)
+                            c["medico"] = step
+                        movidos.append((step, cands))
 
-                if valido:
-                    obj = objetivo_global()
-                    if obj < melhor_obj - 0.02:
-                        melhor_obj = obj
-                        melhor_cadeia = ("esq", a, b)
+                    if valido:
+                        obj = objetivo_global()
+                        if obj < melhor_obj - 0.02:
+                            melhor_obj = obj
+                            melhor_cadeia = ("esq", a, b, passo)
 
-                for step, cand in reversed(movidos):
-                    grupos_finais[step - 1].remove(cand)
-                    grupos_finais[step].insert(0, cand)
-                    cand["medico"] = step + 1
+                    for step, cands in reversed(movidos):
+                        for c in reversed(cands):
+                            grupos_finais[step - 1].remove(c)
+                            grupos_finais[step].insert(0, c)
+                            c["medico"] = step + 1
 
-        for a in range(0, k - 1):
-            for b in range(a + 1, k):
-                movidos = []
-                valido = True
-                for step in range(a, b):
-                    moveis = [
-                        p for p in grupos_finais[step]
-                        if p.get("origem") == "PDF" and p.get("medico_fixo") is None
-                    ]
-                    if len(moveis) <= 1:
-                        valido = False
-                        break
-                    cand = moveis[-1]
-                    grupos_finais[step].remove(cand)
-                    grupos_finais[step + 1].insert(0, cand)
-                    cand["medico"] = step + 2
-                    movidos.append((step, cand))
+            for a in range(0, k - 1):
+                for b in range(a + 1, k):
+                    movidos = []
+                    valido = True
+                    for step in range(a, b):
+                        moveis = [
+                            p for p in grupos_finais[step]
+                            if p.get("origem") == "PDF" and p.get("medico_fixo") is None
+                        ]
+                        if len(moveis) <= passo:
+                            valido = False
+                            break
+                        cands = moveis[-passo:]
+                        for c in reversed(cands):
+                            grupos_finais[step].remove(c)
+                            grupos_finais[step + 1].insert(0, c)
+                            c["medico"] = step + 2
+                        movidos.append((step, cands))
 
-                if valido:
-                    obj = objetivo_global()
-                    if obj < melhor_obj - 0.02:
-                        melhor_obj = obj
-                        melhor_cadeia = ("dir", a, b)
+                    if valido:
+                        obj = objetivo_global()
+                        if obj < melhor_obj - 0.02:
+                            melhor_obj = obj
+                            melhor_cadeia = ("dir", a, b, passo)
 
-                for step, cand in reversed(movidos):
-                    grupos_finais[step + 1].remove(cand)
-                    grupos_finais[step].append(cand)
-                    cand["medico"] = step + 1
+                    for step, cands in reversed(movidos):
+                        for c in cands:
+                            grupos_finais[step + 1].remove(c)
+                            grupos_finais[step].append(c)
+                            c["medico"] = step + 1
 
         if not melhor_cadeia:
             break
 
-        direcao, a, b = melhor_cadeia
+        direcao, a, b, passo = melhor_cadeia
         if direcao == "esq":
             for step in range(b, a, -1):
                 moveis = [
                     p for p in grupos_finais[step]
                     if p.get("origem") == "PDF" and p.get("medico_fixo") is None
                 ]
-                cand = moveis[0]
-                grupos_finais[step].remove(cand)
-                grupos_finais[step - 1].append(cand)
-                cand["medico"] = step
+                cands = moveis[:passo]
+                for c in cands:
+                    grupos_finais[step].remove(c)
+                    grupos_finais[step - 1].append(c)
+                    c["medico"] = step
         else:
             for step in range(a, b):
                 moveis = [
                     p for p in grupos_finais[step]
                     if p.get("origem") == "PDF" and p.get("medico_fixo") is None
                 ]
-                cand = moveis[-1]
-                grupos_finais[step].remove(cand)
-                grupos_finais[step + 1].insert(0, cand)
-                cand["medico"] = step + 2
+                cands = moveis[-passo:]
+                for c in reversed(cands):
+                    grupos_finais[step].remove(c)
+                    grupos_finais[step + 1].insert(0, c)
+                    c["medico"] = step + 2
 
 
 def extrair_dados_pdf(doc):
