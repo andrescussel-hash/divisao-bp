@@ -20,6 +20,7 @@ CUSTO_DESLOC_TROCA_TORRE = 0.5   # +0.5 por torre adicional visitada no Paulista
 CUSTO_DESLOC_TROCA_ANDAR = 0.15  # +0.15 por andar adicional na mesma torre
 
 MAX_DIF_PACIENTES = 2            # Limite máximo de diferença de pacientes entre médicos
+MAX_DIF_ADMISSOES = 2            # Limite máximo de diferença de admissões novas entre médicos
 
 CORES_MEDICOS = [
     (0.78, 0.89, 0.99),  # M1: Azul
@@ -249,6 +250,10 @@ def calcular_carga_total_medico(grupo_pacientes):
     return peso_pacs + custo_desloc
 
 
+def contar_admissoes_grupo(grupo_pacientes):
+    return sum(1 for p in grupo_pacientes if p.get("novo") or p.get("origem") == "ADM")
+
+
 def leito_compacto_prefixo(leito_norm: str, prefixos: tuple) -> bool:
     return any(leito_norm.startswith(p) for p in prefixos)
 
@@ -463,22 +468,34 @@ def aplicar_peculiaridades_globais(todos_itens, peculiaridades, num_medicos):
     return avisos, grupos_juntos
 
 
-def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extra_global=0.0, qtd_extra_global=0):
+def particionar_blocos_continuos_dp(
+    itens_livres,
+    fixos_por_medico,
+    k,
+    peso_extra_global=0.0,
+    qtd_extra_global=0,
+    adm_extra_global=0,
+):
     n = len(itens_livres)
     if n == 0:
         return [[] for _ in range(k)]
 
     pesos = [item["peso"] for item in itens_livres]
     prefixo_peso = [0.0] * (n + 1)
+    prefixo_adm = [0] * (n + 1)
     for i in range(n):
         prefixo_peso[i + 1] = prefixo_peso[i] + pesos[i]
+        prefixo_adm[i + 1] = prefixo_adm[i] + (1 if itens_livres[i].get("novo") else 0)
 
     peso_fixo_total = sum(sum(p["peso"] for p in g) for g in fixos_por_medico)
     qtd_fixa_total = sum(len(g) for g in fixos_por_medico)
+    adm_fixa_total = sum(contar_admissoes_grupo(g) for g in fixos_por_medico)
+
     custo_desloc_estimado = (k - 1) * 0.35 + (CUSTO_DESLOC_MIRANTE if any(x["loc_key"][0] == 2 for x in itens_livres) else 0.0)
 
     carga_ideal = (prefixo_peso[n] + peso_fixo_total + peso_extra_global + custo_desloc_estimado) / k
     qtd_media = (n + qtd_fixa_total + qtd_extra_global) / k
+    adm_media = (prefixo_adm[n] + adm_fixa_total + adm_extra_global) / k
 
     dp = [[float("inf")] * (n + 1) for _ in range(k + 1)]
     corte = [[0] * (n + 1) for _ in range(k + 1)]
@@ -488,6 +505,7 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
         fixos_med = fixos_por_medico[j - 1]
         peso_fixo_med = sum(p["peso"] for p in fixos_med)
         qtd_fixa_med = len(fixos_med)
+        adm_fixa_med = contar_admissoes_grupo(fixos_med)
         locs_fixas_med = [p["loc_key"] for p in fixos_med]
 
         for i in range(0, n + 1):
@@ -501,9 +519,10 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
                 bloco = itens_livres[p:i]
                 soma_pacientes = prefixo_peso[i] - prefixo_peso[p]
                 qtd_pacs_med = qtd_fixa_med + (i - p)
+                qtd_adm_med = adm_fixa_med + (prefixo_adm[i] - prefixo_adm[p])
+
                 locs_bloco = locs_fixas_med + [x["loc_key"] for x in bloco]
                 custo_desloc = calcular_custo_deslocamento_grupo(locs_bloco)
-
                 carga_total_med = peso_fixo_med + soma_pacientes + custo_desloc
 
                 penalidade_corte_andar = 0.0
@@ -519,11 +538,16 @@ def particionar_blocos_continuos_dp(itens_livres, fixos_por_medico, k, peso_extr
                 desvio_qtd = abs(qtd_pacs_med - qtd_media)
                 penalidade_limite_qtd = ((desvio_qtd - 1.15) ** 2) * 150.0 if desvio_qtd > 1.15 else 0.0
 
+                # Penaliza se a contagem de admissões fugir mais de 1.15 da média (evita diferença > 2)
+                desvio_adm = abs(qtd_adm_med - adm_media)
+                penalidade_limite_adm = ((desvio_adm - 1.15) ** 2) * 150.0 if desvio_adm > 1.15 else 0.0
+
                 custo = (
                     dp[j - 1][p]
                     + ((carga_total_med - carga_ideal) ** 2) * 2.0
                     + penalidade_corte_andar
                     + penalidade_limite_qtd
+                    + penalidade_limite_adm
                 )
                 if custo < dp[j][i]:
                     dp[j][i] = custo
@@ -545,11 +569,15 @@ def escolher_medico_item_extra(item, grupos_finais):
 
     loc_ic = item["loc_key"]
     torre_ic = item.get("torre")
-    menor_qtd = min(len(g) for g in grupos_finais) if grupos_finais else 0
+    eh_adm = bool(item.get("novo") or item.get("origem") == "ADM")
 
-    def respeita_teto_qtd(i):
-        # Só permite receber o item se a nova contagem não ultrapassar menor_qtd + MAX_DIF_PACIENTES
-        return (len(grupos_finais[i]) + 1 - menor_qtd) <= MAX_DIF_PACIENTES
+    menor_qtd = min(len(g) for g in grupos_finais) if grupos_finais else 0
+    menor_adm = min(contar_admissoes_grupo(g) for g in grupos_finais) if grupos_finais else 0
+
+    def respeita_tetos(i):
+        ok_qtd = (len(grupos_finais[i]) + 1 - menor_qtd) <= MAX_DIF_PACIENTES
+        ok_adm = (not eh_adm) or ((contar_admissoes_grupo(grupos_finais[i]) + 1 - menor_adm) <= MAX_DIF_ADMISSOES)
+        return ok_qtd and ok_adm
 
     def tem_na_lista_original(grupo, pred):
         return any(p.get("origem") == "PDF" and pred(p["loc_key"]) for p in grupo)
@@ -564,9 +592,13 @@ def escolher_medico_item_extra(item, grupos_finais):
             return min(ja_no_mirante, key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
         return min(range(len(grupos_finais)), key=lambda i: calcular_carga_total_medico(grupos_finais[i]))
 
-    elegiveis = [i for i in range(len(grupos_finais)) if respeita_teto_qtd(i)]
+    elegiveis = [i for i in range(len(grupos_finais)) if respeita_tetos(i)]
     if not elegiveis:
-        elegiveis = list(range(len(grupos_finais)))
+        # Relaxa teto de pacientes antes do teto de admissões se necessário
+        elegiveis = [
+            i for i in range(len(grupos_finais))
+            if (not eh_adm) or ((contar_admissoes_grupo(grupos_finais[i]) + 1 - menor_adm) <= MAX_DIF_ADMISSOES)
+        ] or list(range(len(grupos_finais)))
 
     if loc_ic[0] == 1:
         predio_ic, eixo_torre, andar_ic, quarto_ic, _ = loc_ic
@@ -658,10 +690,14 @@ def rebalancear_fronteiras_finais(grupos_finais):
         excesso_dif_qtd = max(0, (max(qtds) - min(qtds)) - MAX_DIF_PACIENTES)
         penal_limite_qtd = (excesso_dif_qtd ** 2) * 500.0
 
+        adms = [contar_admissoes_grupo(g) for g in grupos_finais]
+        excesso_dif_adm = max(0, (max(adms) - min(adms)) - MAX_DIF_ADMISSOES)
+        penal_limite_adm = (excesso_dif_adm ** 2) * 500.0
+
         medicos_mirante = sum(1 for g in grupos_finais if any(p["loc_key"][0] == 2 for p in g))
         penal_mirante = max(0, medicos_mirante - 1) * 200.0
 
-        return variancia + 0.5 * (amplitude ** 2) + penal_limite_qtd + penal_mirante
+        return variancia + 0.5 * (amplitude ** 2) + penal_limite_qtd + penal_limite_adm + penal_mirante
 
     for _ in range(80):
         melhor_obj = objetivo_global()
@@ -884,6 +920,7 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw
     pacientes_livres.sort(key=lambda p: p["loc_key"])
     peso_extra_global = sum(ic["peso"] for ic in itens_ic) + sum(adm["peso"] for adm in itens_adm)
     qtd_extra_global = len(itens_ic) + len(itens_adm)
+    adm_extra_global = len(itens_adm)
 
     grupos_livres = particionar_blocos_continuos_dp(
         pacientes_livres,
@@ -891,6 +928,7 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw
         num_medicos,
         peso_extra_global=peso_extra_global,
         qtd_extra_global=qtd_extra_global,
+        adm_extra_global=adm_extra_global,
     )
 
     grupos_finais = [[] for _ in range(num_medicos)]
@@ -1062,7 +1100,7 @@ def processar_divisao(pdf_bytes, num_medicos, peculiaridades, interconsultas_raw
     for i in range(num_medicos):
         c_total = calcular_carga_total_medico(grupos_finais[i])
         c_desloc = calcular_custo_deslocamento_grupo([p["loc_key"] for p in grupos_finais[i]])
-        qtd_adm = sum(1 for p in grupos_finais[i] if p.get("novo") or p.get("origem") == "ADM")
+        qtd_adm = contar_admissoes_grupo(grupos_finais[i])
         tabela_cargas.append({
             "Médico": f"M{i+1}",
             "Pacientes": contagem_total[i],
