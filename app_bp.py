@@ -484,7 +484,6 @@ def particionar_blocos_continuos_dp(
     qtd_media = (n + qtd_fixa_total + qtd_extra_global) / k
     total_adms = prefixo_adm[n] + adm_fixa_total + adm_extra_global
     adm_media = total_adms / k
-    # Teto máximo absoluto de admissões permitido por médico para garantir dif <= MAX_DIF_ADMISSOES
     teto_adm_med = int(adm_media) + MAX_DIF_ADMISSOES
 
     dp = [[float("inf")] * (n + 1) for _ in range(k + 1)]
@@ -524,13 +523,11 @@ def particionar_blocos_continuos_dp(
                     if loc_ant[0] == 2 and loc_ini[0] == 2:
                         penalidade_corte_andar += 200.0
 
-                # Penaliza se a contagem de pacientes fugir mais de 1.15 da média (evita diferença > 2)
                 desvio_qtd = abs(qtd_pacs_med - qtd_media)
-                penalidade_limite_qtd = ((desvio_qtd - 1.15) ** 2) * 200.0 if desvio_qtd > 1.15 else 0.0
+                penalidade_limite_qtd = ((desvio_qtd - 1.1) ** 2) * 300.0 if desvio_qtd > 1.1 else 0.0
 
-                # Penalidade fortíssima se ultrapassar o teto de admissões por médico
                 excesso_adm = max(0, qtd_adm_med - teto_adm_med)
-                penalidade_limite_adm = (excesso_adm ** 2) * 2500.0
+                penalidade_limite_adm = (excesso_adm ** 2) * 3000.0
 
                 custo = (
                     dp[j - 1][p]
@@ -675,24 +672,25 @@ def rebalancear_fronteiras_finais(grupos_finais):
         variancia = sum((c - media) ** 2 for c in cargas)
         amplitude = max(cargas) - min(cargas)
 
+        # Ambos os tetos (<= 2 pacientes e <= 2 admissões) são restrições rígidas de prioridade máxima
         qtds = [len(g) for g in grupos_finais]
         excesso_dif_qtd = max(0, (max(qtds) - min(qtds)) - MAX_DIF_PACIENTES)
-        penal_limite_qtd = (excesso_dif_qtd ** 2) * 800.0
+        penal_limite_qtd = (excesso_dif_qtd ** 2) * 5000.0
 
         adms = [contar_admissoes_grupo(g) for g in grupos_finais]
         excesso_dif_adm = max(0, (max(adms) - min(adms)) - MAX_DIF_ADMISSOES)
-        penal_limite_adm = (excesso_dif_adm ** 2) * 2500.0
+        penal_limite_adm = (excesso_dif_adm ** 2) * 5000.0
 
         medicos_mirante = sum(1 for g in grupos_finais if any(p["loc_key"][0] == 2 for p in g))
         penal_mirante = max(0, medicos_mirante - 1) * 200.0
 
         return variancia + 0.5 * (amplitude ** 2) + penal_limite_qtd + penal_limite_adm + penal_mirante
 
-    for _ in range(100):
+    for _ in range(120):
         melhor_obj = objetivo_global()
-        melhor_cadeia = None
+        melhor_acao = None
 
-        # Permite mover 1, 2 ou 3 pacientes da fronteira por vez para destravar blocos de admissões
+        # 1) Movimentos em cadeia nas fronteiras do PDF (1, 2 ou 3 pacientes)
         for passo in (1, 2, 3):
             for b in range(1, k):
                 for a in range(0, b):
@@ -717,7 +715,7 @@ def rebalancear_fronteiras_finais(grupos_finais):
                         obj = objetivo_global()
                         if obj < melhor_obj - 0.02:
                             melhor_obj = obj
-                            melhor_cadeia = ("esq", a, b, passo)
+                            melhor_acao = ("esq", a, b, passo)
 
                     for step, cands in reversed(movidos):
                         for c in reversed(cands):
@@ -748,7 +746,7 @@ def rebalancear_fronteiras_finais(grupos_finais):
                         obj = objetivo_global()
                         if obj < melhor_obj - 0.02:
                             melhor_obj = obj
-                            melhor_cadeia = ("dir", a, b, passo)
+                            melhor_acao = ("dir", a, b, passo)
 
                     for step, cands in reversed(movidos):
                         for c in cands:
@@ -756,11 +754,33 @@ def rebalancear_fronteiras_finais(grupos_finais):
                             grupos_finais[step].append(c)
                             c["medico"] = step + 1
 
-        if not melhor_cadeia:
+        # 2) Realocação direta de item extra (IC/ADM não fixo e fora do Mirante) caso a fronteira do PDF tenha admissões travando o teto
+        for orig in range(k):
+            extras_moveis = [
+                p for p in grupos_finais[orig]
+                if p.get("origem") in ("IC", "ADM")
+                and p.get("medico_fixo") is None
+                and p["loc_key"][0] != 2
+            ]
+            for ext in extras_moveis:
+                for dest in range(k):
+                    if dest == orig:
+                        continue
+                    grupos_finais[orig].remove(ext)
+                    grupos_finais[dest].append(ext)
+                    obj = objetivo_global()
+                    if obj < melhor_obj - 0.02:
+                        melhor_obj = obj
+                        melhor_acao = ("extra", orig, dest, ext)
+                    grupos_finais[dest].remove(ext)
+                    grupos_finais[orig].append(ext)
+
+        if not melhor_acao:
             break
 
-        direcao, a, b, passo = melhor_cadeia
-        if direcao == "esq":
+        tipo = melhor_acao[0]
+        if tipo == "esq":
+            _, a, b, passo = melhor_acao
             for step in range(b, a, -1):
                 moveis = [
                     p for p in grupos_finais[step]
@@ -771,7 +791,8 @@ def rebalancear_fronteiras_finais(grupos_finais):
                     grupos_finais[step].remove(c)
                     grupos_finais[step - 1].append(c)
                     c["medico"] = step
-        else:
+        elif tipo == "dir":
+            _, a, b, passo = melhor_acao
             for step in range(a, b):
                 moveis = [
                     p for p in grupos_finais[step]
@@ -782,6 +803,10 @@ def rebalancear_fronteiras_finais(grupos_finais):
                     grupos_finais[step].remove(c)
                     grupos_finais[step + 1].insert(0, c)
                     c["medico"] = step + 2
+        elif tipo == "extra":
+            _, orig, dest, ext = melhor_acao
+            grupos_finais[orig].remove(ext)
+            grupos_finais[dest].append(ext)
 
 
 def extrair_dados_pdf(doc):
